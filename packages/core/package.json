@@ -1,0 +1,22 @@
+{
+  "name": "@ai-rag/core",
+  "version": "1.0.0",
+  "description": "AI RAG Core - 共享核心逻辑",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.5.0",
+    "ollama": "^0.5.0",
+    "@babel/parser": "^7.23.0",
+    "@vue/compiler-sfc": "^3.4.0",
+    "ts-morph": "^21.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "ai-rag",
+  "version": "1.0.0",
+  "private": true,
+  "description": "前端代码 RAG 系统 - 基于 Ollama 的代码搜索和分析工具",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "yarn workspace @ai-rag/web dev",
+    "dev:cli": "yarn workspace @ai-rag/cli dev",
+    "build:web": "yarn workspace @ai-rag/web build",
+    "build:cli": "yarn workspace @ai-rag/cli build",
+    "build:core": "yarn workspace @ai-rag/core build",
+    "build": "yarn build:core && yarn build:web && yarn build:cli",
+    "lint": "yarn workspaces run lint",
+    "test": "yarn workspaces run test"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "packageManager": "yarn@1.22.19"
+}
