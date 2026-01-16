@@ -1,48 +1,63 @@
-import { Ollama } from 'ollama'
+import fetch from 'node-fetch'
 
 export interface OllamaConfig {
   baseUrl: string
   embeddingModel: string
+  chatModel?: string
   timeout?: number
 }
 
 export class OllamaClient {
-  private client: Ollama
   private config: OllamaConfig
 
   constructor(config: OllamaConfig) {
     this.config = config
-    this.client = new Ollama({
-      host: config.baseUrl,
-    })
   }
 
-  /**
-   * 健康检查
-   */
   async healthCheck(): Promise<boolean> {
     try {
-      await this.client.list()
-      return true
-    } catch (error) {
+      const response = await fetch(`${this.config.baseUrl}/api/tags`)
+      return response.ok
+    } catch {
       return false
     }
   }
 
-  /**
-   * 生成文本的向量表示
-   */
-  async generateEmbedding(text: string): Promise<Float32Array> {
-    const response = await this.client.embeddings({
-      model: this.config.embeddingModel,
-      prompt: text,
-    })
-    return new Float32Array(response.embedding)
+  async generateEmbedding(text: string, retries = 3): Promise<Float32Array> {
+    // bge-m3 模型限制: 保守设置为 8000 字符
+    const maxLength = 8000
+    const truncatedText = text.length > maxLength ? text.substring(0, maxLength) + '...' : text
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const response = await fetch(`${this.config.baseUrl}/api/embeddings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: this.config.embeddingModel,
+            prompt: truncatedText,
+          }),
+          signal: AbortSignal.timeout(this.config.timeout || 60000),
+        })
+
+        if (!response.ok) {
+          throw new Error(`Ollama API error: ${response.statusText}`)
+        }
+
+        const data = await response.json() as { embedding: number[] }
+        return new Float32Array(data.embedding)
+      } catch (error) {
+        if (attempt === retries) {
+          throw error
+        }
+        // 等待后重试
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt))
+      }
+    }
+
+    throw new Error('Failed to generate embedding after retries')
   }
 
-  /**
-   * 批量生成向量
-   */
   async generateEmbeddings(texts: string[]): Promise<Float32Array[]> {
     const embeddings: Float32Array[] = []
     for (const text of texts) {
@@ -50,5 +65,26 @@ export class OllamaClient {
       embeddings.push(embedding)
     }
     return embeddings
+  }
+
+  async chat(messages: Array<{ role: string; content: string }>): Promise<string> {
+    const chatModel = this.config.chatModel || 'qwen2.5-coder:14b'
+
+    const response = await fetch(`${this.config.baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: chatModel,
+        messages,
+        stream: false,
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Ollama chat API error: ${response.statusText}`)
+    }
+
+    const data = await response.json() as { message: { content: string } }
+    return data.message.content
   }
 }
