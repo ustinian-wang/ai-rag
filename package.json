@@ -14,7 +14,12 @@
     "build:core": "yarn workspace @ai-rag/core build",
     "build": "yarn build:core && yarn build:web && yarn build:cli",
     "lint": "yarn workspaces run lint",
-    "test": "yarn workspaces run test"
+    "test": "yarn workspaces run test",
+    "rag": "node packages/cli/dist/index.js",
+    "rag:add": "node packages/cli/dist/index.js add",
+    "rag:list": "node packages/cli/dist/index.js list",
+    "rag:index": "node packages/cli/dist/index.js index",
+    "rag:search": "node packages/cli/dist/index.js search"
   },
   "engines": {
     "node": ">=18.0.0"

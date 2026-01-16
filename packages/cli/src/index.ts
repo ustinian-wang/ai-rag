@@ -109,8 +109,8 @@ program
 
       for (let i = 0; i < filesToIndex.length; i++) {
         spinner.text = `解析文件 ${i + 1}/${filesToIndex.length}...`
-        const unit = await parseFile(filesToIndex[i], project.name)
-        codeUnits.push(unit)
+        const units = await parseFile(filesToIndex[i], project.name)
+        codeUnits.push(...units)
       }
 
       spinner.text = '生成向量并存储...'
@@ -135,6 +135,8 @@ program
   .description('搜索代码')
   .argument('<query>', '搜索查询')
   .option('-l, --limit <number>', '结果数量限制', '10')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-v, --verbose', '显示详细信息（包含完整文件内容）')
   .action(async (query, options) => {
     const spinner = ora('正在搜索...').start()
 
@@ -150,16 +152,57 @@ program
         ollamaClient
       )
 
-      const results = await indexStore.search(query, parseInt(options.limit))
-      spinner.succeed(`找到 ${results.length} 个结果`)
+      // 构建搜索选项
+      const searchOptions: any = { limit: parseInt(options.limit) }
+      if (options.project) {
+        searchOptions.projects = [options.project]
+        spinner.text = `正在 ${options.project} 项目中搜索...`
+      }
 
-      results.forEach((result: any, index: number) => {
-        console.log(chalk.cyan(`\n[${index + 1}] ${result.name}`))
-        console.log(chalk.gray(`  项目: ${result.project}`))
-        console.log(chalk.gray(`  文件: ${result.filePath}`))
-        console.log(chalk.gray(`  相似度: ${(1 - result.score).toFixed(4)}`))
-        console.log(chalk.gray(`  行号: ${result.startLine}-${result.endLine}`))
-      })
+      const results = await indexStore.search(query, searchOptions)
+      spinner.succeed(`找到 ${results.length} 个结果${options.project ? ` (项目: ${options.project})` : ''}`)
+
+      const fs = await import('fs/promises')
+
+      for (let index = 0; index < results.length; index++) {
+        const result = results[index]
+
+        console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+        console.log(chalk.cyan.bold(`[${index + 1}/${results.length}] ${result.name}`))
+        console.log(chalk.gray(`项目: ${result.project}`))
+        console.log(chalk.gray(`文件: ${result.filePath}:${result.startLine}-${result.endLine}`))
+        console.log(chalk.gray(`类型: ${result.type}`))
+        console.log(chalk.gray(`相似度: ${(1 - result.score).toFixed(4)}`))
+
+        // 显示依赖关系
+        if (result.dependencies && result.dependencies.length > 0) {
+          console.log(chalk.yellow(`\n依赖关系:`))
+          result.dependencies.forEach((dep: string) => {
+            console.log(chalk.gray(`  - ${dep}`))
+          })
+        }
+
+        // 显示代码片段
+        console.log(chalk.green(`\n代码片段:`))
+        console.log(chalk.white(result.content.substring(0, 500)))
+        if (result.content.length > 500) {
+          console.log(chalk.gray('... (已截断)'))
+        }
+
+        // 如果启用 verbose 模式，显示完整文件内容
+        if (options.verbose) {
+          try {
+            const fullContent = await fs.readFile(result.filePath, 'utf-8')
+            console.log(chalk.blue(`\n完整文件内容:`))
+            console.log(chalk.white(fullContent))
+          } catch (error) {
+            console.log(chalk.red(`无法读取文件: ${error instanceof Error ? error.message : error}`))
+          }
+        }
+      }
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+      console.log(chalk.green(`提示: 使用 -v 或 --verbose 选项查看完整文件内容`))
     } catch (error) {
       spinner.fail('搜索失败')
       console.error(chalk.red(error instanceof Error ? error.message : error))
