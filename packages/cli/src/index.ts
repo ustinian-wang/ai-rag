@@ -210,4 +210,123 @@ program
     }
   })
 
+// 智能分析命令
+program
+  .command('analyze')
+  .description('智能分析缺陷（使用 LLM 分析问题并定位代码）')
+  .argument('<bug-description>', '缺陷描述')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-l, --limit <number>', '结果数量限制', '10')
+  .action(async (bugDescription, options) => {
+    const spinner = ora('正在进行智能分析...').start()
+
+    try {
+      const config = await loadConfig()
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      // 动态导入 IntelligentAnalyzer
+      const { IntelligentAnalyzer } = await import('../../core/dist/analyzer/index.js')
+      const analyzer = new IntelligentAnalyzer(ollamaClient, indexStore)
+
+      spinner.text = '正在分析缺陷描述...'
+
+      const result = await analyzer.analyze(bugDescription, {
+        project: options.project,
+        maxResults: parseInt(options.limit),
+      })
+
+      spinner.succeed('智能分析完成！')
+
+      // 显示分析结果
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold(`📋 问题分析`))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+
+      console.log(chalk.yellow(`组件名称: ${result.bugAnalysis.componentName}`))
+      console.log(chalk.yellow(`问题现象: ${result.bugAnalysis.symptom}`))
+
+      if (result.bugAnalysis.steps.length > 0) {
+        console.log(chalk.yellow(`\n操作步骤:`))
+        result.bugAnalysis.steps.forEach((step, i) => {
+          console.log(chalk.gray(`  ${i + 1}. ${step}`))
+        })
+      }
+
+      if (result.bugAnalysis.possibleCauses.length > 0) {
+        console.log(chalk.yellow(`\n可能原因:`))
+        result.bugAnalysis.possibleCauses.forEach((cause) => {
+          console.log(chalk.gray(`  - ${cause}`))
+        })
+      }
+
+      // 显示搜索结果
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold(`🔍 相关代码 (${result.searchResults.length} 个)`))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+
+      result.searchResults.slice(0, 5).forEach((r, i) => {
+        console.log(chalk.green(`[${i + 1}] ${r.name}`))
+        console.log(chalk.gray(`    文件: ${r.filePath}:${r.startLine}-${r.endLine}`))
+        console.log(chalk.gray(`    类型: ${r.type}`))
+        console.log(chalk.gray(`    相似度: ${(1 - r.score).toFixed(4)}`))
+      })
+
+      // 显示代码分析
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold(`🔬 代码分析`))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+
+      if (result.codeAnalysis.suspiciousCode.length > 0) {
+        console.log(chalk.red(`可疑代码位置:`))
+        result.codeAnalysis.suspiciousCode.forEach((code, i) => {
+          const confidenceColor =
+            code.confidence === 'high' ? chalk.red : code.confidence === 'medium' ? chalk.yellow : chalk.gray
+          console.log(
+            confidenceColor(
+              `  [${i + 1}] ${code.filePath}:${code.startLine}-${code.endLine} (${code.confidence})`
+            )
+          )
+          console.log(chalk.gray(`      原因: ${code.reason}`))
+        })
+      }
+
+      if (result.codeAnalysis.dataFlow.length > 0) {
+        console.log(chalk.blue(`\n数据流分析:`))
+        result.codeAnalysis.dataFlow.forEach((flow) => {
+          console.log(chalk.gray(`  - ${flow}`))
+        })
+      }
+
+      if (result.codeAnalysis.fixSuggestions.length > 0) {
+        console.log(chalk.green(`\n💡 修复建议:`))
+        result.codeAnalysis.fixSuggestions.forEach((suggestion, i) => {
+          console.log(chalk.white(`  ${i + 1}. ${suggestion}`))
+        })
+      }
+
+      // 显示摘要
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold(`📊 分析摘要`))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(result.summary))
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+    } catch (error) {
+      spinner.fail('智能分析失败')
+      console.error(chalk.red(error instanceof Error ? error.message : error))
+      if (error instanceof Error && error.stack) {
+        console.error(chalk.gray(error.stack))
+      }
+      process.exit(1)
+    }
+  })
+
 program.parse()

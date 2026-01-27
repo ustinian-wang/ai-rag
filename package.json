@@ -19,7 +19,8 @@
     "rag:add": "node packages/cli/dist/index.js add",
     "rag:list": "node packages/cli/dist/index.js list",
     "rag:index": "node packages/cli/dist/index.js index",
-    "rag:search": "node packages/cli/dist/index.js search"
+    "rag:search": "node packages/cli/dist/index.js search",
+    "rag:analyze": "node packages/cli/dist/index.js analyze"
   },
   "engines": {
     "node": ">=18.0.0"

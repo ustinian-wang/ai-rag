@@ -67,8 +67,13 @@ export class OllamaClient {
     return embeddings
   }
 
-  async chat(messages: Array<{ role: string; content: string }>): Promise<string> {
+  async chat(input: string | Array<{ role: string; content: string }>): Promise<string> {
     const chatModel = this.config.chatModel || 'qwen2.5-coder:14b'
+
+    // 如果输入是字符串，转换为消息数组
+    const messages = typeof input === 'string'
+      ? [{ role: 'user', content: input }]
+      : input
 
     const response = await fetch(`${this.config.baseUrl}/api/chat`, {
       method: 'POST',
@@ -78,6 +83,7 @@ export class OllamaClient {
         messages,
         stream: false,
       }),
+      signal: AbortSignal.timeout(this.config.timeout || 120000),
     })
 
     if (!response.ok) {
