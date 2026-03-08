@@ -5,6 +5,7 @@ import chalk from 'chalk'
 import ora from 'ora'
 import Table from 'cli-table3'
 import path from 'path'
+import fs from 'fs/promises'
 import { addProject, getProjects, getProject, updateProject, loadConfig } from '../../core/dist/config/index.js'
 import { scanDirectory } from '../../core/dist/parser/scanner.js'
 import { parseFile } from '../../core/dist/parser/index.js'
@@ -12,6 +13,105 @@ import { IndexStore } from '../../core/dist/search/index.js'
 import { OllamaClient } from '../../core/dist/vectorizer/ollama.js'
 
 const program = new Command()
+
+interface IndexedFileState {
+  mtimeMs: number
+  size: number
+}
+
+interface ProjectIndexState {
+  projectId: string
+  updatedAt: string
+  files: Record<string, IndexedFileState>
+}
+
+function getIndexStatePath(projectId: string): string {
+  return path.join(process.cwd(), '.ai-rag-data', 'index-state', `${projectId}.json`)
+}
+
+async function loadIndexState(projectId: string): Promise<ProjectIndexState | null> {
+  try {
+    const filePath = getIndexStatePath(projectId)
+    const content = await fs.readFile(filePath, 'utf-8')
+    return JSON.parse(content) as ProjectIndexState
+  } catch {
+    return null
+  }
+}
+
+async function saveIndexState(projectId: string, files: Record<string, IndexedFileState>): Promise<void> {
+  const filePath = getIndexStatePath(projectId)
+  await fs.mkdir(path.dirname(filePath), { recursive: true })
+  const state: ProjectIndexState = {
+    projectId,
+    updatedAt: new Date().toISOString(),
+    files,
+  }
+  await fs.writeFile(filePath, JSON.stringify(state, null, 2), 'utf-8')
+}
+
+function escapeSqlString(value: string): string {
+  return value.replace(/'/g, "''")
+}
+
+async function removeVectorsByFilePaths(dbPath: string, filePaths: string[]): Promise<void> {
+  if (filePaths.length === 0) return
+
+  const { connect } = await import('@lancedb/lancedb')
+
+  try {
+    const db = await connect(dbPath)
+    const table = await db.openTable('code_units')
+
+    for (const filePath of filePaths) {
+      const safePath = escapeSqlString(filePath)
+      await table.delete(`file_path = '${safePath}'`)
+    }
+  } catch {
+    // 表不存在时跳过删除，后续 add 会自动创建
+  }
+}
+
+function buildChatPrompt(
+  question: string,
+  results: Array<{
+    filePath: string
+    startLine: number
+    endLine: number
+    name: string
+    type: string
+    content: string
+  }>
+): string {
+  const context = results
+    .map((r, i) => {
+      return [
+        `来源[${i + 1}]`,
+        `文件: ${r.filePath}:${r.startLine}-${r.endLine}`,
+        `名称: ${r.name}`,
+        `类型: ${r.type}`,
+        '代码片段:',
+        r.content,
+      ].join('\n')
+    })
+    .join('\n\n---\n\n')
+
+  return `你是一个前端代码助手。请基于给定代码上下文回答用户问题。
+
+用户问题：
+${question}
+
+代码上下文：
+${context}
+
+回答要求：
+1. 只根据给定上下文回答，不能编造未出现的实现细节。
+2. 如果上下文不足，明确说"当前上下文不足以确定"，并说明还需要什么信息。
+3. 先给出简洁结论，再给出依据。
+4. 依据里必须引用来源编号（如：来源[1]、来源[2]）。
+5. 最后给出 2-3 条可执行建议。
+`
+}
 
 program
   .name('ai-rag')
@@ -76,17 +176,25 @@ program
 program
   .command('index')
   .description('构建项目索引')
-  .argument('<project-id>', '项目 ID')
+  .argument('<project>', '项目 ID 或项目名称')
   .option('-l, --limit <number>', '限制索引文件数量', '100')
-  .action(async (projectId, options) => {
+  .option('-i, --incremental', '增量构建：仅重建变更文件（含删除同步）')
+  .action(async (projectInput, options) => {
     const spinner = ora('正在构建索引...').start()
 
     try {
-      const project = await getProject(projectId)
+      const projectById = await getProject(projectInput)
+      const projectList = projectById ? [] : await getProjects()
+      const projectByName = projectById
+        ? null
+        : projectList.find((item: any) => item.name === projectInput)
+      const project = projectById || projectByName
+
       if (!project) {
-        spinner.fail('项目不存在')
+        spinner.fail(`项目不存在: ${projectInput}`)
         process.exit(1)
       }
+      const projectId = project.id
 
       const config = await loadConfig()
       const ollamaClient = new OllamaClient({
@@ -98,30 +206,93 @@ program
         path.join(process.cwd(), config.storage.lanceDir),
         ollamaClient
       )
+      const dbPath = path.join(process.cwd(), config.storage.lanceDir)
 
       spinner.text = '扫描文件...'
       const files = await scanDirectory(project.path)
-      spinner.text = `找到 ${files.length} 个文件，开始解析...`
+      spinner.text = `Found ${files.length} files, preparing index...`
 
       const limit = parseInt(options.limit)
-      const filesToIndex = files.slice(0, limit)
+      const fullFileState: Record<string, IndexedFileState> = {}
+      const fileByRelativePath = new Map<string, any>()
+
+      for (const file of files) {
+        const stats = await fs.stat(file.path)
+        fullFileState[file.relativePath] = {
+          mtimeMs: stats.mtimeMs,
+          size: file.size,
+        }
+        fileByRelativePath.set(file.relativePath, file)
+      }
+
+      let filesToIndex = files.slice(0, limit)
+      let deletedRelativePaths: string[] = []
+
+      if (options.incremental) {
+        const previousState = await loadIndexState(projectId)
+        const previousFiles = previousState?.files || {}
+
+        const changedRelativePaths = Object.keys(fullFileState).filter((relativePath) => {
+          const prev = previousFiles[relativePath]
+          const next = fullFileState[relativePath]
+          return !prev || prev.mtimeMs !== next.mtimeMs || prev.size !== next.size
+        })
+
+        deletedRelativePaths = Object.keys(previousFiles).filter(
+          (relativePath) => !fullFileState[relativePath]
+        )
+
+        // 增量模式下必须处理所有变更文件，否则会导致状态和索引不一致
+        filesToIndex = changedRelativePaths
+          .map((relativePath) => fileByRelativePath.get(relativePath))
+          .filter(Boolean)
+
+        const changedAbsPaths = filesToIndex.map((f: any) => f.path)
+        const deletedAbsPaths = deletedRelativePaths.map((relativePath) =>
+          path.join(project.path, relativePath)
+        )
+        const removePaths = [...changedAbsPaths, ...deletedAbsPaths]
+
+        if (removePaths.length > 0) {
+          spinner.text = `Cleaning old vectors: ${removePaths.length} files...`
+          await removeVectorsByFilePaths(dbPath, removePaths)
+        }
+
+        if (filesToIndex.length === 0 && deletedRelativePaths.length === 0) {
+          await updateProject(projectId, {
+            indexed: true,
+            lastIndexed: new Date().toISOString(),
+          })
+          await saveIndexState(projectId, fullFileState)
+          spinner.succeed('Incremental index complete: no changes detected')
+          return
+        }
+      }
+
       const codeUnits = []
 
       for (let i = 0; i < filesToIndex.length; i++) {
-        spinner.text = `解析文件 ${i + 1}/${filesToIndex.length}...`
+        spinner.text = `Parsing file ${i + 1}/${filesToIndex.length}...`
         const units = await parseFile(filesToIndex[i], project.name)
         codeUnits.push(...units)
       }
 
-      spinner.text = '生成向量并存储...'
+      spinner.text = 'Generating embeddings and storing...'
       await indexStore.indexCodeUnits(codeUnits)
 
       await updateProject(projectId, {
         indexed: true,
         lastIndexed: new Date().toISOString(),
       })
+      await saveIndexState(projectId, fullFileState)
 
-      spinner.succeed(`索引构建完成！已索引 ${codeUnits.length} 个文件`)
+      if (options.incremental) {
+        spinner.succeed(
+          `Incremental index complete: rebuilt ${filesToIndex.length} files, removed ${deletedRelativePaths.length} files`
+        )
+      } else {
+        spinner.succeed(`Full index complete: processed ${filesToIndex.length} files`)
+      }
     } catch (error) {
       spinner.fail('索引构建失败')
       console.error(chalk.red(error instanceof Error ? error.message : error))
@@ -206,6 +377,116 @@ program
     } catch (error) {
       spinner.fail('搜索失败')
       console.error(chalk.red(error instanceof Error ? error.message : error))
+      process.exit(1)
+    }
+  })
+
+// Chat 命令
+program
+  .command('chat')
+  .description('基于代码索引进行问答（检索 + LLM 回答）')
+  .argument('<question>', '问题描述')
+  .option('-l, --limit <number>', '检索结果数量（向量召回）', '6')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-s, --show-sources', '显示引用来源详情')
+  .option('--context-limit <number>', '用于回答的片段数量', '3')
+  .option('--snippet-chars <number>', '每个片段最大字符数', '500')
+  .option('-m, --model <name>', '指定聊天模型（如 qwen2.5-coder:7b）')
+  .option('--fast', '快速模式（更少上下文，更快回答）')
+  .action(async (question, options) => {
+    const spinner = ora('正在进行问答分析...').start()
+    const totalStart = Date.now()
+
+    try {
+      const config = await loadConfig()
+      const searchLimit = Math.max(1, parseInt(options.limit))
+      const contextLimit = Math.max(1, parseInt(options.contextLimit))
+      const snippetChars = Math.max(200, parseInt(options.snippetChars))
+      const fastMode = !!options.fast
+
+      const finalContextLimit = fastMode ? Math.min(contextLimit, 2) : contextLimit
+      const finalSnippetChars = fastMode ? Math.min(snippetChars, 320) : snippetChars
+
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+        chatModel: options.model || (config as any).ollama?.chatModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      const searchOptions: any = { limit: searchLimit }
+      if (options.project) {
+        searchOptions.projects = [options.project]
+      }
+
+      spinner.text = '正在检索相关代码...'
+      const searchStart = Date.now()
+      const results = await indexStore.search(question, searchOptions)
+      const searchCostMs = Date.now() - searchStart
+
+      if (results.length === 0) {
+        spinner.warn('没有找到相关代码，无法生成可靠回答')
+        console.log(chalk.yellow('请先确认已建立索引，或更换问题描述后重试。'))
+        return
+      }
+
+      // 仅保留回答阶段最有价值的上下文，减少 token 可显著加速
+      const contextResults = results.slice(0, finalContextLimit).map((r) => ({
+        ...r,
+        content: r.content.substring(0, finalSnippetChars),
+      }))
+
+      spinner.text = '正在生成回答...'
+      const chatStart = Date.now()
+      const prompt = buildChatPrompt(question, contextResults)
+      const answer = await ollamaClient.chat(prompt)
+      const chatCostMs = Date.now() - chatStart
+      const totalCostMs = Date.now() - totalStart
+
+      spinner.succeed(`问答完成（检索 ${results.length}，回答参考 ${contextResults.length}）`)
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('💬 问题'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(question))
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('🧠 回答'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(answer.trim()))
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('⏱️ 耗时'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.gray(`检索耗时: ${(searchCostMs / 1000).toFixed(2)}s`))
+      console.log(chalk.gray(`回答耗时: ${(chatCostMs / 1000).toFixed(2)}s`))
+      console.log(chalk.gray(`总耗时: ${(totalCostMs / 1000).toFixed(2)}s`))
+
+      if (options.showSources) {
+        console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+        console.log(chalk.cyan.bold('📚 引用来源'))
+        console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+
+        contextResults.forEach((r, i) => {
+          console.log(chalk.green(`[${i + 1}] ${r.name}`))
+          console.log(chalk.gray(`    文件: ${r.filePath}:${r.startLine}-${r.endLine}`))
+          console.log(chalk.gray(`    类型: ${r.type}`))
+          console.log(chalk.gray(`    距离: ${r.score.toFixed(4)}`))
+        })
+      }
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+      console.log(chalk.green('提示: 可用 --fast、--context-limit、--snippet-chars、--model 继续提速'))
+    } catch (error) {
+      spinner.fail('问答失败')
+      console.error(chalk.red(error instanceof Error ? error.message : error))
+      if (error instanceof Error && error.stack) {
+        console.error(chalk.gray(error.stack))
+      }
       process.exit(1)
     }
   })
