@@ -30,18 +30,18 @@
 
 1. **Node.js**: >= 18.0.0
 2. **Yarn**: >= 1.22.19
-3. **Ollama**: 已安装并运行，需要下载以下模型：
-   - `nomic-embed-text` (274 MB) - 用于生成代码向量
-   - `qwen2.5-coder:14b` (9.0 GB, 可选) - 用于代码分析增强
+3. **Ollama**: 已安装并运行，建议下载以下模型：
+   - `bge-m3` (推荐) - 用于生成代码向量
+   - `qwen2.5-coder:7b` 或 `qwen2.5-coder:14b` (可选) - 用于 chat/analyze 生成回答
 
 ### 安装 Ollama 模型
 
 ```bash
-# 安装 embedding 模型（必需）
-ollama pull nomic-embed-text
+# 安装 embedding 模型（必需，推荐 bge-m3）
+ollama pull bge-m3
 
-# 安装代码分析模型（可选，用于智能分析功能）
-ollama pull qwen2.5-coder:14b
+# 安装代码分析模型（可选）
+ollama pull qwen2.5-coder:7b
 ```
 
 ### 安装项目依赖
@@ -127,12 +127,17 @@ yarn rag list
 ### 索引构建
 
 ```bash
-# 构建项目索引
-yarn rag index <项目ID> [options]
+# 构建项目索引（支持项目 ID 或项目名称）
+yarn rag index <项目ID或项目名称> [options]
 
 # 选项:
 #   -l, --limit <number>  限制索引文件数量（默认: 100）
+#   -i, --incremental     增量构建（仅重建变更文件，自动处理删除）
 #   示例: yarn rag index <project-id> --limit 200
+
+# 示例：
+yarn rag index mallUniapp-res --incremental
+yarn rag index 1768480831707-1dbo8bfqg --incremental
 ```
 
 ### 代码搜索
@@ -167,6 +172,26 @@ yarn rag analyze "用户登录时密码验证失败"
 yarn rag analyze "表单提交后数据丢失" --project mallsite-res
 ```
 
+### 问答模式（chat）
+
+```bash
+# 基于检索结果生成分析回答
+yarn rag chat <问题> [options]
+
+# 选项:
+#   -l, --limit <number>         检索候选数量（默认: 6）
+#   -p, --project <name>         指定项目名称
+#   -s, --show-sources           显示引用来源
+#   --context-limit <number>     参与回答的片段数量（默认: 3）
+#   --snippet-chars <number>     每个片段最大字符数（默认: 500）
+#   -m, --model <name>           指定 chat 模型（如 qwen2.5-coder:7b）
+#   --fast                       快速模式（更少上下文，更快回答）
+
+# 示例：
+yarn rag chat "社区团购模块的加载团长活动逻辑是什么样的" -p mallUniapp-res -s
+yarn rag chat "登录失败时前端怎么处理" -p mallsite-res --fast -m qwen2.5-coder:7b
+```
+
 ### 命令示例
 
 ```bash
@@ -182,7 +207,10 @@ yarn rag index <project-id>
 # 4. 搜索代码
 yarn rag search "用户登录验证逻辑"
 
-# 5. 智能分析缺陷
+# 5. 智能问答
+yarn rag chat "用户登录失败时前端处理逻辑是什么"
+
+# 6. 智能分析缺陷
 yarn rag analyze "点击提交按钮后页面没有响应"
 ```
 
@@ -415,12 +443,11 @@ ollama serve
 
 ### Q: 索引构建很慢怎么办？
 
-A: 可以限制索引文件数量：
+A: 可以限制索引文件数量，或者启用增量构建：
 ```bash
 yarn rag index <project-id> --limit 50
+yarn rag index <project-id-or-name> --incremental
 ```
-
-或者使用增量更新（未来版本支持）。
 
 ### Q: 搜索结果不准确怎么办？
 
@@ -429,10 +456,50 @@ A:
 2. 尝试使用更具体的问题描述
 3. 使用 `--verbose` 选项查看完整上下文
 4. 使用 `analyze` 命令进行智能分析
+5. 使用 `chat -s` 查看引用来源，优先确认来源是否命中业务入口函数
 
 ### Q: 如何更新索引？
 
-A: 重新运行索引命令即可，系统会自动检测文件变化并更新（未来版本支持增量更新）。
+A: 已支持增量索引：
+```bash
+# 推荐：每次 pull 代码后执行
+yarn rag index <project-id-or-name> --incremental
+
+# 需要全量重建时
+yarn rag index <project-id-or-name>
+```
+
+### Q: `limit` 是什么？不设置会怎样？
+
+A: `limit` 在不同命令含义不同：
+- `index --limit`：最多处理多少个文件（默认 100）
+- `search --limit`：返回多少条搜索结果（默认 10）
+- `chat --limit`：检索候选数量（默认 6，最终参与回答还受 `--context-limit` 限制）
+
+不设置会使用默认值，通常可直接用；需要更高召回时再增大。
+
+### Q: 为什么会出现负数“相似度”？
+
+A: CLI 展示的“相似度”实际是 `1 - distance`（distance 为向量距离）。  
+当距离大于 1 时，显示值会变成负数。这不影响排序逻辑，主要用于相对比较（值越大越接近）。
+
+### Q: embedding 偶发 500 / EOF 怎么排查？
+
+A: 常见原因是 embedding 服务瞬时不稳定或上下文阈值不匹配。建议按顺序排查：
+1. 先确认 Ollama 与模型状态：
+```bash
+ollama ps
+curl http://localhost:11434/api/tags
+```
+2. 打开 embedding 调试日志（查看 request id、输入长度、重试恢复情况）：
+```bash
+AI_RAG_EMBED_DEBUG=1 yarn rag index <project-id-or-name> --incremental
+```
+3. 若服务 context 较小（例如 4096），可设置：
+```bash
+AI_RAG_OLLAMA_CONTEXT=4096
+```
+系统会按该 context 自动计算安全阈值并重试（默认最多 5 次）。
 
 ### Q: 支持哪些文件类型？
 
