@@ -6,7 +6,7 @@
 
 - 🔍 **语义搜索**: 基于向量相似度的智能代码搜索，理解代码语义而非简单关键词匹配
 - 📚 **多粒度索引**: 支持文件、函数、组件、代码块多层级索引
-- 🎯 **智能分析**: 使用 LLM 分析缺陷描述，自动定位可疑代码位置
+- 🎯 **问答优先**: 默认通过 `chat` 完成检索增强问答，降低命令心智负担
 - 🚀 **多种交互方式**: CLI 命令行工具 + Web 可视化界面
 - 🔒 **本地优先**: 所有数据和模型都在本地运行，无需云服务，数据安全
 - ⚡ **增量更新**: 智能检测文件变化，只更新修改的文件
@@ -32,7 +32,7 @@
 2. **Yarn**: >= 1.22.19
 3. **Ollama**: 已安装并运行，建议下载以下模型：
    - `bge-m3` (推荐) - 用于生成代码向量
-   - `qwen2.5-coder:7b` 或 `qwen2.5-coder:14b` (可选) - 用于 chat/analyze 生成回答
+   - `qwen2.5-coder:7b` 或 `qwen2.5-coder:14b` (可选) - 用于 chat 生成回答
 
 ### 安装 Ollama 模型
 
@@ -83,7 +83,7 @@ yarn rag add <项目名称> <项目路径>
   ],
   "ollama": {
     "baseUrl": "http://localhost:11434",
-    "embeddingModel": "nomic-embed-text",
+    "embeddingModel": "bge-m3",
     "timeout": 30000
   },
   "storage": {
@@ -97,7 +97,7 @@ yarn rag add <项目名称> <项目路径>
 ### 配置说明
 
 - **ollama.baseUrl**: Ollama 服务地址，默认 `http://localhost:11434`
-- **ollama.embeddingModel**: 用于生成向量的模型，默认 `nomic-embed-text`
+- **ollama.embeddingModel**: 用于生成向量的模型，默认 `bge-m3`
 - **storage.lanceDir**: LanceDB 向量数据库存储目录
 - **storage.cacheDir**: 代码解析缓存目录
 
@@ -118,7 +118,7 @@ yarn rag <command> [options]
 ```bash
 # 添加项目到配置
 yarn rag add <项目名称> <项目路径>
-# 示例: yarn rag add mallsite-res ../mallsite-res/js
+# 示例: yarn rag add <project-name> /path/to/project
 
 # 列出所有项目
 yarn rag list
@@ -136,8 +136,8 @@ yarn rag index <项目ID或项目名称> [options]
 #   示例: yarn rag index <project-id> --limit 200
 
 # 示例：
-yarn rag index mallUniapp-res --incremental
-yarn rag index 1768480831707-1dbo8bfqg --incremental
+yarn rag index <project-name> --incremental
+yarn rag index <project-id> --incremental
 ```
 
 ### 问答模式（chat）
@@ -156,15 +156,25 @@ yarn rag chat <问题> [options]
 #   --fast                       快速模式（更少上下文，更快回答）
 
 # 示例：
-yarn rag chat "社区团购模块的加载团长活动逻辑是什么样的" -p mallUniapp-res -s
-yarn rag chat "登录失败时前端怎么处理" -p mallsite-res --fast -m qwen2.5-coder:7b
+yarn rag chat "某个业务模块的加载逻辑是什么样的" -p <project-name> -s
+yarn rag chat "登录失败时前端怎么处理" -p <project-name> --fast -m qwen2.5-coder:7b
+```
+
+### 命令模式说明（默认仅 chat）
+
+```bash
+# 当前 CLI 默认对外仅保留 chat 入口
+yarn rag --help
+
+# 如需临时启用旧命令（search/analyze），可设置环境变量
+AI_RAG_ENABLE_LEGACY_COMMANDS=1 yarn rag --help
 ```
 
 ### 命令示例
 
 ```bash
 # 1. 添加项目
-yarn rag add mallsite-res ../mallsite-res/js
+yarn rag add <project-name> /path/to/project
 
 # 2. 查看项目列表（获取项目 ID）
 yarn rag list
@@ -246,7 +256,7 @@ Content-Type: application/json
 {
   "query": "用户登录验证",
   "filters": {
-    "projects": ["mallsite-res"],
+    "projects": ["<project-name>"],
     "fileTypes": [".vue", ".js"],
     "codeTypes": ["function", "component"]
   },
@@ -263,7 +273,7 @@ Content-Type: application/json
       "score": 0.95,
       "content": "代码内容...",
       "filePath": "src/components/LoginForm.vue",
-      "project": "mallsite-res",
+      "project": "<project-name>",
       "type": "component",
       "name": "LoginForm",
       "startLine": 10,
@@ -384,7 +394,7 @@ yarn test
 - **全栈框架**: Next.js 14 (App Router + Route Handlers)
 - **前端**: React 18 + Tailwind CSS
 - **向量数据库**: LanceDB（本地文件存储）
-- **Embedding**: Ollama HTTP API (`nomic-embed-text`)
+- **Embedding**: Ollama HTTP API (`bge-m3`)
 - **代码解析**: 
   - `@babel/parser` - JS/TS/JSX/TSX 解析
   - `@vue/compiler-sfc` - Vue 单文件组件解析
@@ -434,7 +444,6 @@ yarn rag index <project-id-or-name>
 
 A: `limit` 在不同命令含义不同：
 - `index --limit`：最多处理多少个文件（默认 100）
-- `search --limit`：返回多少条搜索结果（默认 10）
 - `chat --limit`：检索候选数量（默认 6，最终参与回答还受 `--context-limit` 限制）
 
 不设置会使用默认值，通常可直接用；需要更高召回时再增大。
@@ -484,7 +493,7 @@ A: 所有数据存储在 `.ai-rag-data/` 目录：
 
 - ✨ 初始版本发布
 - ✅ 支持项目管理和索引构建
-- ✅ 支持语义搜索和智能分析
+- ✅ 支持语义检索与 chat 问答
 - ✅ CLI 命令行工具
 - ✅ Web 可视化界面
 
