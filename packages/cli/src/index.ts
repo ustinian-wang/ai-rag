@@ -109,8 +109,9 @@ ${context}
 1. 只根据给定上下文回答，不能编造未出现的实现细节。
 2. 如果上下文不足，明确说"当前上下文不足以确定"，并说明还需要什么信息。
 3. 先给出简洁结论，再给出依据。
-4. 依据里必须引用来源编号（如：来源[1]、来源[2]）。
-5. 最后给出 2-3 条可执行建议。
+4. 每条结论必须绑定至少一个来源编号（如：来源[1]、来源[2]）。
+5. 严格按以下结构输出：## 结论、## 证据、## 不确定项、## 建议。
+6. 如果无法给出带来源的结论，请在“## 不确定项”中明确说明。
 `
 }
 
@@ -212,10 +213,56 @@ function selectChatContextResults(
   query: string,
   limit: number
 ): ChatSearchResult[] {
+  const relevanceOf = (r: ChatSearchResult): number => {
+    return evaluateEvidenceScore(r) + calcQueryCoverageScore(r, queryTokens)
+  }
+  const similarityOf = (a: ChatSearchResult, b: ChatSearchResult): number => {
+    const aTokens = tokenizeQuery(`${a.filePath} ${a.name} ${a.content}`)
+    const bTokens = tokenizeQuery(`${b.filePath} ${b.name} ${b.content}`)
+    if (aTokens.length === 0 || bTokens.length === 0) return 0
+    const bSet = new Set(bTokens.map((t) => t.toLowerCase()))
+    let inter = 0
+    aTokens.forEach((t) => {
+      if (bSet.has(t.toLowerCase())) inter += 1
+    })
+    const union = new Set([...aTokens.map((t) => t.toLowerCase()), ...bTokens.map((t) => t.toLowerCase())]).size
+    return union === 0 ? 0 : inter / union
+  }
+
+  const selectByMMR = (candidates: ChatSearchResult[], topN: number, lambda = 0.7): ChatSearchResult[] => {
+    if (candidates.length <= topN) return candidates.slice(0, topN)
+    const selected: ChatSearchResult[] = []
+    const remaining = [...candidates]
+    remaining.sort((a, b) => relevanceOf(b) - relevanceOf(a))
+    const first = remaining.shift()
+    if (first) selected.push(first)
+
+    while (selected.length < topN && remaining.length > 0) {
+      let bestIndex = 0
+      let bestScore = -Infinity
+      for (let i = 0; i < remaining.length; i++) {
+        const candidate = remaining[i]
+        const relevance = relevanceOf(candidate)
+        let maxSim = 0
+        selected.forEach((s) => {
+          maxSim = Math.max(maxSim, similarityOf(candidate, s))
+        })
+        const mmrScore = lambda * relevance - (1 - lambda) * maxSim * 100
+        if (mmrScore > bestScore) {
+          bestScore = mmrScore
+          bestIndex = i
+        }
+      }
+      selected.push(remaining.splice(bestIndex, 1)[0])
+    }
+    return selected
+  }
+
   const queryTokens = tokenizeQuery(query)
   const selected = new Map<string, ChatSearchResult>()
 
-  rerankedResults.slice(0, limit).forEach((r) => selected.set(r.id, r))
+  const rerankedHead = selectByMMR(rerankedResults, limit)
+  rerankedHead.forEach((r) => selected.set(r.id, r))
 
   const vectorCandidates = vectorResults
     .map((r) => ({
@@ -235,7 +282,7 @@ function selectChatContextResults(
     selected.set(item.result.id, item.result)
   }
 
-  return Array.from(selected.values()).slice(0, limit)
+  return selectByMMR(Array.from(selected.values()), limit)
 }
 
 function extractRelevantSnippet(content: string, query: string, maxChars: number): string {
@@ -266,6 +313,15 @@ function extractRelevantSnippet(content: string, query: string, maxChars: number
   const prefix = start > 0 ? '...' : ''
   const suffix = end < content.length ? '...' : ''
   return `${prefix}${content.substring(start, end)}${suffix}`
+}
+
+function hasValidSourceCitation(answer: string, sourceCount: number): boolean {
+  const matches = answer.match(/来源\[(\d+)\]/g) || []
+  if (matches.length === 0) return false
+  return matches.some((m) => {
+    const num = Number(m.replace(/[^\d]/g, ''))
+    return Number.isFinite(num) && num >= 1 && num <= sourceCount
+  })
 }
 
 program
@@ -625,7 +681,18 @@ program
       spinner.text = '正在生成回答...'
       const chatStart = Date.now()
       const prompt = buildChatPrompt(question, contextResults)
-      const answer = await ollamaClient.chat(prompt)
+      let answer = await ollamaClient.chat(prompt)
+      if (!hasValidSourceCitation(answer, contextResults.length)) {
+        spinner.text = '检测到回答缺少有效来源，进行一次强约束重试...'
+        const strictPrompt = `${prompt}
+
+你上一版回答缺少有效来源编号。请重写并满足：
+1) 使用“## 结论 / ## 证据 / ## 不确定项 / ## 建议”四段。
+2) “## 结论”中每条结论必须包含来源编号（来源[1]...）。
+3) 只允许引用 1 到 ${contextResults.length} 的来源编号。
+4) 若证据不足，明确写“当前上下文不足以确定”。`
+        answer = await ollamaClient.chat(strictPrompt)
+      }
       const chatCostMs = Date.now() - chatStart
       const totalCostMs = Date.now() - totalStart
 
