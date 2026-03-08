@@ -21,6 +21,7 @@ export interface ExtractedFunction {
  */
 export function extractFunctions(code: string, filePath: string): ExtractedFunction[] {
   const functions: ExtractedFunction[] = []
+  const isVueFile = filePath.endsWith('.vue')
 
   try {
     // 尝试多种解析策略
@@ -90,6 +91,70 @@ export function extractFunctions(code: string, filePath: string): ExtractedFunct
             comments: node.leadingComments?.map((c: any) => c.value).join('\n'),
           })
         }
+      },
+
+      // Vue Options API: methods/computed/watch/lifecycle 的对象方法
+      ObjectMethod(path: NodePath<t.ObjectMethod>) {
+        if (!isVueFile) return
+        const node = path.node
+        const inExportDefault = !!path.findParent((p) => p.isExportDefaultDeclaration())
+        if (!inExportDefault) return
+
+        let methodName = ''
+        if (t.isIdentifier(node.key)) {
+          methodName = node.key.name
+        } else if (t.isStringLiteral(node.key)) {
+          methodName = node.key.value
+        }
+
+        if (node.loc && methodName) {
+          functions.push({
+            name: methodName,
+            type: 'method',
+            params: node.params.map((p: any) => t.isIdentifier(p) ? p.name : 'param'),
+            startLine: node.loc.start.line,
+            endLine: node.loc.end.line,
+            content: code.split('\n').slice(node.loc.start.line - 1, node.loc.end.line).join('\n'),
+            isAsync: node.async || false,
+            isExported: false,
+            comments: node.leadingComments?.map((c: any) => c.value).join('\n'),
+          })
+        }
+      },
+
+      // Vue Options API: key: function() {} / key: () => {}
+      ObjectProperty(path: NodePath<t.ObjectProperty>) {
+        if (!isVueFile) return
+        const node = path.node
+        const inExportDefault = !!path.findParent((p) => p.isExportDefaultDeclaration())
+        if (!inExportDefault || !node.loc) return
+
+        const value = node.value
+        const isFunctionLike = t.isFunctionExpression(value) || t.isArrowFunctionExpression(value)
+        if (!isFunctionLike) return
+
+        let fnName = ''
+        if (t.isIdentifier(node.key)) {
+          fnName = node.key.name
+        } else if (t.isStringLiteral(node.key)) {
+          fnName = node.key.value
+        }
+        if (!fnName) return
+
+        functions.push({
+          name: fnName,
+          type: t.isArrowFunctionExpression(value) ? 'arrow' : 'function',
+          params: value.params.map((p: any) => t.isIdentifier(p) ? p.name : 'param'),
+          startLine: value.loc?.start.line || node.loc.start.line,
+          endLine: value.loc?.end.line || node.loc.end.line,
+          content: code
+            .split('\n')
+            .slice((value.loc?.start.line || node.loc.start.line) - 1, value.loc?.end.line || node.loc.end.line)
+            .join('\n'),
+          isAsync: value.async || false,
+          isExported: false,
+          comments: value.leadingComments?.map((c: any) => c.value).join('\n'),
+        })
       },
     })
   } catch (error) {

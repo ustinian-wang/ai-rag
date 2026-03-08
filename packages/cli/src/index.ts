@@ -113,6 +113,128 @@ ${context}
 `
 }
 
+type ChatSearchResult = {
+  id: string
+  filePath: string
+  startLine: number
+  endLine: number
+  name: string
+  type: string
+  content: string
+  score: number
+  keywordMatches?: string[]
+}
+
+function evaluateEvidenceScore(result: ChatSearchResult): number {
+  const filePath = result.filePath.toLowerCase()
+  const name = result.name.toLowerCase()
+  const content = result.content.toLowerCase()
+  let score = 0
+
+  // 优先代码语义单元
+  if (result.type === 'function') score += 120
+  if (result.type === 'component') score += 100
+  if (result.type === 'file') score += 20
+
+  // 优先 src 目录，降低 docs 干扰
+  if (filePath.includes('/src/')) score += 80
+  if (filePath.includes('/docs/')) score -= 140
+
+  // 有关键词命中说明和问题语义更贴近
+  score += (result.keywordMatches?.length || 0) * 25
+
+  // 距离越小越好
+  score += Math.max(0, 800 - result.score) * 0.1
+
+  // 通用结构特征加分（无意图硬编码）
+  if (/api|load|get|set|fetch|beforeenter|init|filter|handle|show/.test(name)) score += 40
+  if (/router|api\/|setdata|vuex|watch|computed|template/.test(filePath + ' ' + content)) score += 30
+
+  return score
+}
+
+function tokenizeQuery(query: string): string[] {
+  const chineseWords = query.match(/[\u4e00-\u9fa5]{2,8}/g) || []
+  const englishWords = query
+    .toLowerCase()
+    .split(/[^a-z0-9_]+/)
+    .filter((w) => w.length >= 3)
+  return [...new Set([...chineseWords, ...englishWords])]
+}
+
+function calcQueryCoverageScore(result: ChatSearchResult, queryTokens: string[]): number {
+  if (queryTokens.length === 0) return 0
+  const haystack = `${result.filePath} ${result.name} ${result.content}`.toLowerCase()
+  let matched = 0
+  queryTokens.forEach((t) => {
+    if (haystack.includes(t.toLowerCase())) matched += 1
+  })
+  return matched * 40
+}
+
+function rerankForChat(results: ChatSearchResult[], query: string): ChatSearchResult[] {
+  const queryTokens = tokenizeQuery(query)
+  return [...results].sort((a, b) => {
+    const scoreA = evaluateEvidenceScore(a) + calcQueryCoverageScore(a, queryTokens)
+    const scoreB = evaluateEvidenceScore(b) + calcQueryCoverageScore(b, queryTokens)
+    return scoreB - scoreA
+  })
+}
+
+function hasEnoughCodeEvidence(results: ChatSearchResult[], query: string): boolean {
+  const top = rerankForChat(results, query).slice(0, 4)
+  const strongCodeCount = top.filter((r) => {
+    const pathLower = r.filePath.toLowerCase()
+    const isCodeType = r.type === 'function' || r.type === 'component'
+    const isSrcCode = pathLower.includes('/src/')
+    const notDoc = !pathLower.includes('/docs/')
+    return isCodeType && isSrcCode && notDoc
+  }).length
+
+  return strongCodeCount >= 2
+}
+
+function mergeUniqueResults(primary: ChatSearchResult[], fallback: ChatSearchResult[]): ChatSearchResult[] {
+  const merged = new Map<string, ChatSearchResult>()
+  primary.forEach((r) => merged.set(r.id, r))
+  fallback.forEach((r) => {
+    if (!merged.has(r.id)) merged.set(r.id, r)
+  })
+  return Array.from(merged.values())
+}
+
+function selectChatContextResults(
+  rerankedResults: ChatSearchResult[],
+  vectorResults: ChatSearchResult[],
+  query: string,
+  limit: number
+): ChatSearchResult[] {
+  const queryTokens = tokenizeQuery(query)
+  const selected = new Map<string, ChatSearchResult>()
+
+  rerankedResults.slice(0, limit).forEach((r) => selected.set(r.id, r))
+
+  const vectorCandidates = vectorResults
+    .map((r) => ({
+      result: r,
+      coverage: calcQueryCoverageScore(r, queryTokens),
+    }))
+    .filter((item) => {
+      const pathLower = item.result.filePath.toLowerCase()
+      const isCodeType = item.result.type === 'function' || item.result.type === 'component'
+      return isCodeType && pathLower.includes('/src/') && !pathLower.includes('/docs/')
+    })
+    .sort((a, b) => b.coverage - a.coverage || a.result.score - b.result.score)
+
+  for (const item of vectorCandidates) {
+    if (selected.size >= limit) break
+    if (item.coverage <= 0) continue
+    selected.set(item.result.id, item.result)
+  }
+
+  return Array.from(selected.values()).slice(0, limit)
+}
+
 program
   .name('ai-rag')
   .description('AI RAG - 前端代码搜索系统 CLI')
@@ -425,7 +547,24 @@ program
 
       spinner.text = '正在检索相关代码...'
       const searchStart = Date.now()
-      const results = await indexStore.search(question, searchOptions)
+      const smartResults = await indexStore.smartSearch(question, searchOptions)
+      const vectorResults = await indexStore.search(question, {
+        ...searchOptions,
+        limit: Math.max(searchLimit * 2, 12),
+      })
+      let results = mergeUniqueResults(smartResults as ChatSearchResult[], vectorResults as ChatSearchResult[])
+      results = rerankForChat(results as ChatSearchResult[], question)
+
+      // 仍然证据偏弱时，再次放大向量候选并重排
+      if (!hasEnoughCodeEvidence(results as ChatSearchResult[], question)) {
+        spinner.text = '检测到证据偏弱，追加更多向量候选...'
+        const widerVectorResults = await indexStore.search(question, {
+          ...searchOptions,
+          limit: Math.max(searchLimit * 4, 20),
+        })
+        results = mergeUniqueResults(results as ChatSearchResult[], widerVectorResults as ChatSearchResult[])
+        results = rerankForChat(results as ChatSearchResult[], question)
+      }
       const searchCostMs = Date.now() - searchStart
 
       if (results.length === 0) {
@@ -435,7 +574,15 @@ program
       }
 
       // 仅保留回答阶段最有价值的上下文，减少 token 可显著加速
-      const contextResults = results.slice(0, finalContextLimit).map((r) => ({
+      // 同时做一次向量召回兜底，降低“命中但未入上下文”风险
+      const selectedContextResults = selectChatContextResults(
+        results as ChatSearchResult[],
+        vectorResults as ChatSearchResult[],
+        question,
+        finalContextLimit
+      )
+
+      const contextResults = selectedContextResults.map((r) => ({
         ...r,
         content: r.content.substring(0, finalSnippetChars),
       }))

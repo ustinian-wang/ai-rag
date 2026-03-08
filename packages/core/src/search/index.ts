@@ -12,6 +12,7 @@ export class IndexStore {
   private queryExpander: QueryExpander
   private reranker: Reranker
   private keywordSearch: KeywordSearch
+  private readonly genericKeywords: Set<string>
 
   constructor(dbPath: string, ollamaClient: OllamaClient) {
     this.dbPath = dbPath
@@ -19,6 +20,20 @@ export class IndexStore {
     this.queryExpander = new QueryExpander(ollamaClient)
     this.reranker = new Reranker(ollamaClient)
     this.keywordSearch = new KeywordSearch(dbPath)
+    this.genericKeywords = new Set([
+      '什么', '怎么样', '什么样', '如何', '怎么', '逻辑', '模块',
+      '功能', '处理', '实现', '问题', '代码'
+    ])
+  }
+
+  private calcKeywordSpecificity(keyword: string): number {
+    const normalized = keyword.trim().toLowerCase()
+    if (!normalized) return 0
+    if (this.genericKeywords.has(normalized)) return 0
+    if (normalized.length >= 6) return 1.2
+    if (normalized.length >= 4) return 1
+    if (normalized.length >= 2) return 0.8
+    return 0.4
   }
 
   /**
@@ -128,18 +143,33 @@ export class IndexStore {
     // 2.2 关键词搜索（补充向量搜索的不足）
     console.log('   执行关键词搜索...')
     const keywordResults = await this.keywordSearch.search(expandedQuery.keywords, { limit: limit })
-    keywordResults.forEach(r => {
+    const filteredKeywordResults = keywordResults.filter(r => {
+      if (options.projects && options.projects.length > 0 && !options.projects.includes(r.project)) {
+        return false
+      }
+      if (options.fileTypes && options.fileTypes.length > 0) {
+        const ext = path.extname(r.filePath)
+        if (!options.fileTypes.includes(ext)) {
+          return false
+        }
+      }
+      if (options.codeTypes && options.codeTypes.length > 0 && !options.codeTypes.includes(r.type)) {
+        return false
+      }
+      return true
+    })
+    filteredKeywordResults.forEach(r => {
       if (!allResults.has(r.id)) {
-        // 关键词搜索的结果，给一个较低的初始分数
-        allResults.set(r.id, { ...r, score: 500 - r.matchScore, source: 'keyword' })
+        // 关键词-only结果默认降权，避免压过向量语义命中
+        allResults.set(r.id, { ...r, score: 900 - r.matchScore, source: 'keyword' })
       } else {
-        // 如果向量搜索也找到了，提升其优先级
+        // 命中向量+关键词，适度提升（成熟融合策略）
         const existing = allResults.get(r.id)
-        existing.score = existing.score - 100 // 大幅降低分数（提高排名）
+        existing.score = existing.score - 40
         existing.source = 'hybrid'
       }
     })
-    console.log(`   关键词搜索找到 ${keywordResults.length} 个结果`)
+    console.log(`   关键词搜索找到 ${keywordResults.length} 个结果，过滤后 ${filteredKeywordResults.length} 个`)
 
     // 3. 关键词过滤和加权
     console.log('\n⚖️  步骤 3: 关键词加权...')
@@ -153,7 +183,8 @@ export class IndexStore {
 
       expandedQuery.keywords.forEach(keyword => {
         if (searchText.includes(keyword.toLowerCase())) {
-          keywordBonus += 200 // 大幅降低分数（距离）= 大幅提高相似度
+          const specificity = this.calcKeywordSpecificity(keyword)
+          keywordBonus += Math.round(45 * specificity)
         }
       })
 
