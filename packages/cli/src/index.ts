@@ -183,13 +183,15 @@ function rerankForChat(results: ChatSearchResult[], query: string): ChatSearchRe
 }
 
 function hasEnoughCodeEvidence(results: ChatSearchResult[], query: string): boolean {
+  const queryTokens = tokenizeQuery(query)
   const top = rerankForChat(results, query).slice(0, 4)
   const strongCodeCount = top.filter((r) => {
     const pathLower = r.filePath.toLowerCase()
     const isCodeType = r.type === 'function' || r.type === 'component'
     const isSrcCode = pathLower.includes('/src/')
     const notDoc = !pathLower.includes('/docs/')
-    return isCodeType && isSrcCode && notDoc
+    const hasQueryCoverage = calcQueryCoverageScore(r, queryTokens) > 0
+    return isCodeType && isSrcCode && notDoc && hasQueryCoverage
   }).length
 
   return strongCodeCount >= 2
@@ -234,6 +236,36 @@ function selectChatContextResults(
   }
 
   return Array.from(selected.values()).slice(0, limit)
+}
+
+function extractRelevantSnippet(content: string, query: string, maxChars: number): string {
+  if (content.length <= maxChars) return content
+  const queryTokens = tokenizeQuery(query).filter((t) => t.length >= 2)
+  const contentLower = content.toLowerCase()
+
+  let hitIndex = -1
+  for (const token of queryTokens) {
+    const idx = contentLower.indexOf(token.toLowerCase())
+    if (idx >= 0) {
+      hitIndex = idx
+      break
+    }
+  }
+
+  if (hitIndex < 0) {
+    return `${content.substring(0, maxChars)}...`
+  }
+
+  const halfWindow = Math.floor(maxChars / 2)
+  let start = Math.max(0, hitIndex - halfWindow)
+  let end = Math.min(content.length, start + maxChars)
+  if (end - start < maxChars) {
+    start = Math.max(0, end - maxChars)
+  }
+
+  const prefix = start > 0 ? '...' : ''
+  const suffix = end < content.length ? '...' : ''
+  return `${prefix}${content.substring(start, end)}${suffix}`
 }
 
 program
@@ -511,11 +543,11 @@ program
   .command('chat')
   .description('基于代码索引进行问答（检索 + LLM 回答）')
   .argument('<question>', '问题描述')
-  .option('-l, --limit <number>', '检索结果数量（向量召回）', '6')
+  .option('-l, --limit <number>', '检索结果数量（向量召回）', '8')
   .option('-p, --project <name>', '指定项目名称')
   .option('-s, --show-sources', '显示引用来源详情')
-  .option('--context-limit <number>', '用于回答的片段数量', '3')
-  .option('--snippet-chars <number>', '每个片段最大字符数', '500')
+  .option('--context-limit <number>', '用于回答的片段数量', '6')
+  .option('--snippet-chars <number>', '每个片段最大字符数', '1400')
   .option('-m, --model <name>', '指定聊天模型（如 qwen2.5-coder:7b）')
   .option('--fast', '快速模式（更少上下文，更快回答）')
   .action(async (question, options) => {
@@ -550,7 +582,7 @@ program
 
       spinner.text = '正在检索相关代码...'
       const searchStart = Date.now()
-      const smartResults = await indexStore.smartSearch(question, searchOptions)
+      const smartResults = await indexStore.smartSearch(question, { ...searchOptions, enableRerank: false })
       const vectorResults = await indexStore.search(question, {
         ...searchOptions,
         limit: Math.max(searchLimit * 2, 12),
@@ -587,7 +619,7 @@ program
 
       const contextResults = selectedContextResults.map((r) => ({
         ...r,
-        content: r.content.substring(0, finalSnippetChars),
+        content: extractRelevantSnippet(r.content, question, finalSnippetChars),
       }))
 
       spinner.text = '正在生成回答...'

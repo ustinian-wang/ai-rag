@@ -110,9 +110,10 @@ export class IndexStore {
       projects?: string[]
       fileTypes?: string[]
       codeTypes?: string[]
+      enableRerank?: boolean
     } = {}
   ): Promise<any[]> {
-    const { limit = 20 } = options
+    const { limit = 20, enableRerank = true } = options
 
     console.log(`\n🔍 智能搜索: "${query}"`)
 
@@ -209,6 +210,17 @@ export class IndexStore {
       matchedResults.sort((a, b) => a.score - b.score)
       unmatchedResults.sort((a, b) => a.score - b.score)
       finalResults = [...matchedResults, ...unmatchedResults.slice(0, limit - matchedResults.length)]
+    }
+
+    if (!enableRerank) {
+      console.log('\n⏭️  步骤 4: 跳过 LLM 重排序（由上层处理）...')
+      console.log(`\n✅ 找到 ${finalResults.length} 个结果`)
+      finalResults.slice(0, 5).forEach((r, i) => {
+        console.log(
+          `   ${i + 1}. ${r.type}: ${r.name} (分数: ${r.score.toFixed(2)}, 关键词: ${r.keywordMatches?.join(', ') || '无'})`
+        )
+      })
+      return finalResults
     }
 
     // 5. 使用 LLM 重排序（提升准确率）

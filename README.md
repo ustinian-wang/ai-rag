@@ -147,11 +147,11 @@ yarn rag index <project-id> --incremental
 yarn rag chat <问题> [options]
 
 # 选项:
-#   -l, --limit <number>         检索候选数量（默认: 6）
+#   -l, --limit <number>         检索候选数量（默认: 8）
 #   -p, --project <name>         指定项目名称
 #   -s, --show-sources           显示引用来源
-#   --context-limit <number>     参与回答的片段数量（默认: 3）
-#   --snippet-chars <number>     每个片段最大字符数（默认: 500）
+#   --context-limit <number>     参与回答的片段数量（默认: 6）
+#   --snippet-chars <number>     每个片段最大字符数（默认: 1400）
 #   -m, --model <name>           指定 chat 模型（如 qwen2.5-coder:7b）
 #   --fast                       快速模式（更少上下文，更快回答）
 
@@ -444,7 +444,7 @@ yarn rag index <project-id-or-name>
 
 A: `limit` 在不同命令含义不同：
 - `index --limit`：最多处理多少个文件（默认 100）
-- `chat --limit`：检索候选数量（默认 6，最终参与回答还受 `--context-limit` 限制）
+- `chat --limit`：检索候选数量（默认 8，最终参与回答还受 `--context-limit` 限制）
 
 不设置会使用默认值，通常可直接用；需要更高召回时再增大。
 
