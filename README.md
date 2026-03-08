@@ -140,38 +140,6 @@ yarn rag index mallUniapp-res --incremental
 yarn rag index 1768480831707-1dbo8bfqg --incremental
 ```
 
-### 代码搜索
-
-```bash
-# 搜索代码
-yarn rag search <查询> [options]
-
-# 选项:
-#   -l, --limit <number>     结果数量限制（默认: 10）
-#   -p, --project <name>     指定项目名称
-#   -v, --verbose            显示完整文件内容
-
-# 示例:
-yarn rag search "用户登录表单验证"
-yarn rag search "用户登录" --project mallsite-res --limit 20
-yarn rag search "表单验证" --verbose
-```
-
-### 智能分析
-
-```bash
-# 智能分析缺陷（使用 LLM 分析问题并定位代码）
-yarn rag analyze <缺陷描述> [options]
-
-# 选项:
-#   -p, --project <name>     指定项目名称
-#   -l, --limit <number>     结果数量限制（默认: 10）
-
-# 示例:
-yarn rag analyze "用户登录时密码验证失败"
-yarn rag analyze "表单提交后数据丢失" --project mallsite-res
-```
-
 ### 问答模式（chat）
 
 ```bash
@@ -204,14 +172,8 @@ yarn rag list
 # 3. 构建索引
 yarn rag index <project-id>
 
-# 4. 搜索代码
-yarn rag search "用户登录验证逻辑"
-
-# 5. 智能问答
+# 4. 智能问答
 yarn rag chat "用户登录失败时前端处理逻辑是什么"
-
-# 6. 智能分析缺陷
-yarn rag analyze "点击提交按钮后页面没有响应"
 ```
 
 ## 🌐 Web 界面
@@ -454,9 +416,8 @@ yarn rag index <project-id-or-name> --incremental
 A: 
 1. 确保索引已完整构建
 2. 尝试使用更具体的问题描述
-3. 使用 `--verbose` 选项查看完整上下文
-4. 使用 `analyze` 命令进行智能分析
-5. 使用 `chat -s` 查看引用来源，优先确认来源是否命中业务入口函数
+3. 使用 `chat -s` 查看引用来源，优先确认来源是否命中业务入口函数
+4. 调高 `chat --limit` 与 `--context-limit`，提升召回覆盖
 
 ### Q: 如何更新索引？
 

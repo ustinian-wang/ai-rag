@@ -13,6 +13,7 @@ import { IndexStore } from '../../core/dist/search/index.js'
 import { OllamaClient } from '../../core/dist/vectorizer/ollama.js'
 
 const program = new Command()
+const ENABLE_LEGACY_COMMANDS = process.env.AI_RAG_ENABLE_LEGACY_COMMANDS === '1'
 
 interface IndexedFileState {
   mtimeMs: number
@@ -422,16 +423,17 @@ program
     }
   })
 
-// 搜索代码
-program
-  .command('search')
-  .description('搜索代码')
-  .argument('<query>', '搜索查询')
-  .option('-l, --limit <number>', '结果数量限制', '10')
-  .option('-p, --project <name>', '指定项目名称')
-  .option('-v, --verbose', '显示详细信息（包含完整文件内容）')
-  .action(async (query, options) => {
-    const spinner = ora('正在搜索...').start()
+// 搜索代码（旧命令，默认不对外暴露）
+if (ENABLE_LEGACY_COMMANDS) {
+  program
+    .command('search')
+    .description('搜索代码')
+    .argument('<query>', '搜索查询')
+    .option('-l, --limit <number>', '结果数量限制', '10')
+    .option('-p, --project <name>', '指定项目名称')
+    .option('-v, --verbose', '显示详细信息（包含完整文件内容）')
+    .action(async (query, options) => {
+      const spinner = ora('正在搜索...').start()
 
     try {
       const config = await loadConfig()
@@ -501,7 +503,8 @@ program
       console.error(chalk.red(error instanceof Error ? error.message : error))
       process.exit(1)
     }
-  })
+    })
+}
 
 // Chat 命令
 program
@@ -638,15 +641,16 @@ program
     }
   })
 
-// 智能分析命令
-program
-  .command('analyze')
-  .description('智能分析缺陷（使用 LLM 分析问题并定位代码）')
-  .argument('<bug-description>', '缺陷描述')
-  .option('-p, --project <name>', '指定项目名称')
-  .option('-l, --limit <number>', '结果数量限制', '10')
-  .action(async (bugDescription, options) => {
-    const spinner = ora('正在进行智能分析...').start()
+// 智能分析命令（旧命令，默认不对外暴露）
+if (ENABLE_LEGACY_COMMANDS) {
+  program
+    .command('analyze')
+    .description('智能分析缺陷（使用 LLM 分析问题并定位代码）')
+    .argument('<bug-description>', '缺陷描述')
+    .option('-p, --project <name>', '指定项目名称')
+    .option('-l, --limit <number>', '结果数量限制', '10')
+    .action(async (bugDescription, options) => {
+      const spinner = ora('正在进行智能分析...').start()
 
     try {
       const config = await loadConfig()
@@ -755,6 +759,7 @@ program
       }
       process.exit(1)
     }
-  })
+    })
+}
 
 program.parse()
