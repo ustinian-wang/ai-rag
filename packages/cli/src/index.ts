@@ -841,7 +841,10 @@ program
 
       spinner.text = '正在检索相关代码...'
       const searchStart = Date.now()
-      const smartResults = await indexStore.smartSearch(question, { ...searchOptions, enableRerank: false })
+      const smartResults = await indexStore.search(question, {
+        ...searchOptions,
+        limit: Math.max(searchLimit * 3, 24),
+      })
       let vectorResults = await indexStore.search(question, {
         ...searchOptions,
         limit: Math.max(searchLimit * 3, 24),
