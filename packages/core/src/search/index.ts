@@ -36,6 +36,27 @@ export class IndexStore {
     return 0.4
   }
 
+  private tokenize(text: string): string[] {
+    const chinese = text.match(/[\u4e00-\u9fa5]{2,8}/g) || []
+    const english = text
+      .toLowerCase()
+      .split(/[^a-z0-9_]+/)
+      .filter((w) => w.length >= 3)
+    return [...new Set([...chinese, ...english])]
+  }
+
+  private calcOverlapRatio(a: string, b: string): number {
+    const aTokens = this.tokenize(a)
+    const bTokens = this.tokenize(b)
+    if (aTokens.length === 0 || bTokens.length === 0) return 0
+    const bSet = new Set(bTokens.map((t) => t.toLowerCase()))
+    let inter = 0
+    aTokens.forEach((t) => {
+      if (bSet.has(t.toLowerCase())) inter += 1
+    })
+    return inter / Math.max(1, Math.min(aTokens.length, bTokens.length))
+  }
+
   /**
    * 索引代码单元，支持错误处理和跳过失败的单元
    */
@@ -110,17 +131,25 @@ export class IndexStore {
       projects?: string[]
       fileTypes?: string[]
       codeTypes?: string[]
+      enableRerank?: boolean
     } = {}
   ): Promise<any[]> {
-    const { limit = 20 } = options
+    const { limit = 20, enableRerank = true } = options
 
     console.log(`\n🔍 智能搜索: "${query}"`)
 
     // 1. 扩展查询
     console.log('📝 步骤 1: 扩展查询...')
     const expandedQuery = await this.queryExpander.expandQuery(query)
-    console.log(`   关键词: ${expandedQuery.keywords.join(', ')}`)
-    console.log(`   扩展查询: ${expandedQuery.expandedQueries.join(', ')}`)
+    const trustedExpandedQueries = expandedQuery.expandedQueries
+      .filter((q) => this.calcOverlapRatio(query, q) >= 0.2)
+      .slice(0, 2)
+    const trustedKeywords = expandedQuery.keywords
+      .filter((k) => this.calcKeywordSpecificity(k) > 0)
+      .slice(0, 16)
+
+    console.log(`   关键词: ${trustedKeywords.join(', ')}`)
+    console.log(`   扩展查询: ${trustedExpandedQueries.join(', ')}`)
 
     // 2. 混合搜索：向量搜索 + 关键词搜索
     console.log('\n🔎 步骤 2: 执行混合搜索（向量 + 关键词）...')
@@ -131,7 +160,7 @@ export class IndexStore {
     originalResults.forEach(r => allResults.set(r.id, { ...r, score: r.score * 1.0, source: 'vector' }))
 
     // 搜索扩展查询
-    for (const expandedQ of expandedQuery.expandedQueries.slice(0, 2)) {
+    for (const expandedQ of trustedExpandedQueries) {
       const results = await this.search(expandedQ, { ...options, limit: limit })
       results.forEach(r => {
         if (!allResults.has(r.id)) {
@@ -142,7 +171,7 @@ export class IndexStore {
 
     // 2.2 关键词搜索（补充向量搜索的不足）
     console.log('   执行关键词搜索...')
-    const keywordResults = await this.keywordSearch.search(expandedQuery.keywords, { limit: limit })
+    const keywordResults = await this.keywordSearch.search(trustedKeywords, { limit: limit })
     const filteredKeywordResults = keywordResults.filter(r => {
       if (options.projects && options.projects.length > 0 && !options.projects.includes(r.project)) {
         return false
@@ -181,7 +210,7 @@ export class IndexStore {
       // 检查文件路径和名称中的关键词
       const searchText = `${r.filePath} ${r.name} ${r.content}`.toLowerCase()
 
-      expandedQuery.keywords.forEach(keyword => {
+      trustedKeywords.forEach(keyword => {
         if (searchText.includes(keyword.toLowerCase())) {
           const specificity = this.calcKeywordSpecificity(keyword)
           keywordBonus += Math.round(45 * specificity)
@@ -189,7 +218,7 @@ export class IndexStore {
       })
 
       r.score = r.score - keywordBonus
-      r.keywordMatches = expandedQuery.keywords.filter(k =>
+      r.keywordMatches = trustedKeywords.filter(k =>
         searchText.includes(k.toLowerCase())
       )
     })
@@ -209,6 +238,17 @@ export class IndexStore {
       matchedResults.sort((a, b) => a.score - b.score)
       unmatchedResults.sort((a, b) => a.score - b.score)
       finalResults = [...matchedResults, ...unmatchedResults.slice(0, limit - matchedResults.length)]
+    }
+
+    if (!enableRerank) {
+      console.log('\n⏭️  步骤 4: 跳过 LLM 重排序（由上层处理）...')
+      console.log(`\n✅ 找到 ${finalResults.length} 个结果`)
+      finalResults.slice(0, 5).forEach((r, i) => {
+        console.log(
+          `   ${i + 1}. ${r.type}: ${r.name} (分数: ${r.score.toFixed(2)}, 关键词: ${r.keywordMatches?.join(', ') || '无'})`
+        )
+      })
+      return finalResults
     }
 
     // 5. 使用 LLM 重排序（提升准确率）
@@ -280,6 +320,15 @@ export class IndexStore {
       // 按代码类型过滤
       if (codeTypes && codeTypes.length > 0) {
         filteredResults = filteredResults.filter(r => codeTypes.includes(r.type))
+      }
+
+      // 过滤离群高距离结果，减少低相关噪声
+      if (filteredResults.length > 3) {
+        const sortedScores = [...filteredResults].map((r) => r.score).sort((a, b) => a - b)
+        const median = sortedScores[Math.floor(sortedScores.length / 2)] || sortedScores[0]
+        const lowerBound = sortedScores[0]
+        const dynamicMax = Math.max(median * 2.2, lowerBound + 120)
+        filteredResults = filteredResults.filter((r) => r.score <= dynamicMax)
       }
 
       // 返回限制数量的结果

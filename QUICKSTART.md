@@ -39,11 +39,12 @@ yarn build
 ## 步骤 2: 安装 Ollama 模型
 
 ```bash
-# 安装必需的 embedding 模型（约 274 MB）
-ollama pull nomic-embed-text
+# 安装必需的 embedding 模型（推荐 bge-m3）
+ollama pull bge-m3
 
-# （可选）安装代码分析模型（约 9.0 GB）
-ollama pull qwen2.5-coder:14b
+# （可选）安装代码分析模型
+ollama pull qwen2.5-coder:7b
+# 或 ollama pull qwen2.5-coder:14b
 ```
 
 ## 步骤 3: 添加项目
@@ -66,24 +67,30 @@ yarn rag index <project-id>
 yarn rag index <project-id> --limit 50
 ```
 
-## 步骤 5: 搜索代码
+## 步骤 5: 智能问答
 
 ```bash
-# 基本搜索
-yarn rag search "用户登录"
+# 一键问答（rag:chat 内部调用 llm）
+yarn rag:chat "用户登录逻辑是什么"
 
-# 指定项目搜索
-yarn rag search "表单验证" --project mallsite-res
+# 指定项目
+yarn rag:chat "表单验证流程" -p mallsite-res
 
-# 查看完整文件内容
-yarn rag search "用户登录" --verbose
+# 或直接使用 llm 命令
+yarn rag llm "用户登录时密码验证失败" -p mallsite-res
 ```
 
-## 步骤 6: 智能分析（可选）
+## 步骤 6: 分步调试（可选）
 
 ```bash
-# 使用 LLM 分析缺陷
-yarn rag analyze "用户登录时密码验证失败"
+# 查看 rerank 结果（不含 LLM）
+yarn rag rerank "用户登录" -p mallsite-res -v
+
+# 查看拼接的 context
+yarn rag context "用户登录" -p mallsite-res -k 8
+
+# 改写自然语言为检索查询
+yarn rag rewrite "登录失败时前端怎么处理"
 ```
 
 ## 启动 Web 界面（可选）
@@ -116,7 +123,7 @@ ollama serve
 yarn build
 
 # 或使用完整路径
-node packages/cli/dist/index.js search "用户登录"
+node packages/cli/dist/index.js llm "用户登录"
 ```
 
 ### 问题 3: 索引构建失败
@@ -144,11 +151,13 @@ yarn rag list
 # 3. 构建索引
 yarn rag index <project-id> --limit 100
 
-# 4. 搜索代码
-yarn rag search "处理用户输入"
+# 4. 智能问答
+yarn rag:chat "处理用户输入"
 
-# 5. 智能分析缺陷
-yarn rag analyze "表单提交后数据丢失"
+# 5. 分步调试（可选）
+yarn rag rerank "表单提交" -p my-project -v
+yarn rag context "表单提交" -p my-project
+yarn rag llm "表单提交后数据丢失" -p my-project
 ```
 
 祝您使用愉快！🎉

@@ -19,7 +19,12 @@
     "rag:add": "node packages/cli/dist/index.js add",
     "rag:list": "node packages/cli/dist/index.js list",
     "rag:index": "node packages/cli/dist/index.js index",
-    "rag:chat": "node packages/cli/dist/index.js chat"
+    "rag:chat": "node packages/cli/dist/index.js llm",
+    "rag:rewrite": "yarn build:cli && node packages/cli/dist/index.js rewrite",
+    "rag:embed": "node packages/cli/dist/index.js embed",
+    "rag:rerank": "node packages/cli/dist/index.js rerank",
+    "rag:context": "node packages/cli/dist/index.js context",
+    "rag:llm": "node packages/cli/dist/index.js llm"
   },
   "engines": {
     "node": ">=18.0.0"

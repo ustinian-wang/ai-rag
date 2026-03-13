@@ -109,8 +109,11 @@ ${context}
 1. 只根据给定上下文回答，不能编造未出现的实现细节。
 2. 如果上下文不足，明确说"当前上下文不足以确定"，并说明还需要什么信息。
 3. 先给出简洁结论，再给出依据。
-4. 依据里必须引用来源编号（如：来源[1]、来源[2]）。
-5. 最后给出 2-3 条可执行建议。
+4. 每条结论必须绑定至少一个来源编号（如：来源[1]、来源[2]）。
+5. 严格按以下结构输出：## 结论、## 证据、## 不确定项、## 建议。
+6. 如果提供了2个及以上来源，结论和证据应尽量覆盖至少2个不同来源。
+7. 不要输出代码块，不要写示例代码，不要补全上下文中没有出现的代码。
+8. 如果无法给出带来源的结论，请在“## 不确定项”中明确说明。
 `
 }
 
@@ -128,6 +131,7 @@ type ChatSearchResult = {
 
 function evaluateEvidenceScore(result: ChatSearchResult): number {
   const filePath = result.filePath.toLowerCase()
+  const fileName = path.basename(filePath).toLowerCase()
   const name = result.name.toLowerCase()
   const content = result.content.toLowerCase()
   let score = 0
@@ -141,6 +145,10 @@ function evaluateEvidenceScore(result: ChatSearchResult): number {
   if (filePath.includes('/src/')) score += 80
   if (filePath.includes('/docs/')) score -= 140
 
+  // 降低通用工具/索引文件的优先级，避免泛化信息盖过业务实现
+  if (/^(tool|utils?|index|constant|constants)\.(js|ts|vue|md)$/.test(fileName)) score -= 120
+  if (fileName.includes('utilscategory')) score -= 80
+
   // 有关键词命中说明和问题语义更贴近
   score += (result.keywordMatches?.length || 0) * 25
 
@@ -150,6 +158,8 @@ function evaluateEvidenceScore(result: ChatSearchResult): number {
   // 通用结构特征加分（无意图硬编码）
   if (/api|load|get|set|fetch|beforeenter|init|filter|handle|show/.test(name)) score += 40
   if (/router|api\/|setdata|vuex|watch|computed|template/.test(filePath + ' ' + content)) score += 30
+  if (/flush|load|init|request|fetch|query|detail|list/.test(name)) score += 25
+  if (/await\s+\w*(api|request|fetch)|requestwithtoast|requestwithtoastcheck/.test(content)) score += 40
 
   return score
 }
@@ -161,6 +171,65 @@ function tokenizeQuery(query: string): string[] {
     .split(/[^a-z0-9_]+/)
     .filter((w) => w.length >= 3)
   return [...new Set([...chineseWords, ...englishWords])]
+}
+
+function buildRecallQueries(question: string): string[] {
+  const conceptMap: Record<string, string[]> = {
+    加载: ['load', 'fetch', 'request', 'init'],
+    流程: ['flow', 'process', 'handle'],
+    逻辑: ['logic', 'handle', 'process'],
+    详情: ['detail', 'page'],
+    列表: ['list'],
+    活动: ['activity', 'event', 'activ'],
+    跳转: ['route', 'navigate', 'redirect'],
+    初始化: ['init', 'initialize'],
+    获取: ['get', 'fetch', 'query'],
+    展示: ['render', 'show', 'display'],
+  }
+
+  const synonyms: string[] = []
+  for (const [k, values] of Object.entries(conceptMap)) {
+    if (question.includes(k)) synonyms.push(...values)
+  }
+
+  const uniqueSynonyms = [...new Set(synonyms)]
+  if (uniqueSynonyms.length === 0) return [question]
+
+  const expanded = `${question} ${uniqueSynonyms.slice(0, 6).join(' ')}`
+  return [question, expanded]
+}
+
+function buildBridgeQuery(question: string, results: ChatSearchResult[]): string {
+  const top = results.slice(0, 8)
+  const blocked = new Set([
+    'function', 'component', 'default', 'export', 'const', 'return', 'async',
+    'value', 'false', 'true', 'null', 'undefined', 'object', 'string',
+    'number', 'event', 'target', 'dataset', 'utils', 'index', 'tool'
+  ])
+  const bridgeTerms = new Set<string>()
+
+  top.forEach((r) => {
+    const fileBase = path.basename(r.filePath).replace(/\.[a-z0-9]+$/i, '')
+    if (fileBase.length >= 5 && !blocked.has(fileBase.toLowerCase())) {
+      bridgeTerms.add(fileBase)
+    }
+    if (r.name.length >= 5 && !blocked.has(r.name.toLowerCase())) {
+      bridgeTerms.add(r.name)
+    }
+    const idMatches = r.content.match(/[A-Za-z_][A-Za-z0-9_]{4,}/g) || []
+    for (const id of idMatches.slice(0, 16)) {
+      const lower = id.toLowerCase()
+      if (blocked.has(lower)) continue
+      if (/(api|request|fetch|load|init|detail|activ|grouper|signup|route|flush)/.test(lower)) {
+        bridgeTerms.add(id)
+      }
+      if (bridgeTerms.size >= 8) break
+    }
+  })
+
+  const terms = Array.from(bridgeTerms).slice(0, 8)
+  if (terms.length === 0) return question
+  return `${question} ${terms.join(' ')}`
 }
 
 function calcQueryCoverageScore(result: ChatSearchResult, queryTokens: string[]): number {
@@ -183,13 +252,15 @@ function rerankForChat(results: ChatSearchResult[], query: string): ChatSearchRe
 }
 
 function hasEnoughCodeEvidence(results: ChatSearchResult[], query: string): boolean {
+  const queryTokens = tokenizeQuery(query)
   const top = rerankForChat(results, query).slice(0, 4)
   const strongCodeCount = top.filter((r) => {
     const pathLower = r.filePath.toLowerCase()
     const isCodeType = r.type === 'function' || r.type === 'component'
     const isSrcCode = pathLower.includes('/src/')
     const notDoc = !pathLower.includes('/docs/')
-    return isCodeType && isSrcCode && notDoc
+    const hasQueryCoverage = calcQueryCoverageScore(r, queryTokens) > 0
+    return isCodeType && isSrcCode && notDoc && hasQueryCoverage
   }).length
 
   return strongCodeCount >= 2
@@ -204,36 +275,290 @@ function mergeUniqueResults(primary: ChatSearchResult[], fallback: ChatSearchRes
   return Array.from(merged.values())
 }
 
+function getPathDiversityKey(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase()
+  const srcMarker = '/src/'
+  const srcIdx = normalized.indexOf(srcMarker)
+  if (srcIdx >= 0) {
+    const sub = normalized.substring(srcIdx + srcMarker.length)
+    const parts = sub.split('/').filter(Boolean)
+    return parts.slice(0, 2).join('/') || sub
+  }
+  const parts = normalized.split('/').filter(Boolean)
+  return parts.slice(Math.max(0, parts.length - 3)).join('/')
+}
+
+function expandByDiversity(
+  selected: ChatSearchResult[],
+  candidates: ChatSearchResult[],
+  limit: number
+): ChatSearchResult[] {
+  if (selected.length >= limit) return selected.slice(0, limit)
+
+  const targetModuleCount = Math.min(3, limit)
+  const targetTypeCount = Math.min(2, limit)
+  const moduleSet = new Set(selected.map((r) => getPathDiversityKey(r.filePath)))
+  const typeSet = new Set(selected.map((r) => r.type))
+  const chosenIds = new Set(selected.map((r) => r.id))
+  const out = [...selected]
+
+  const sortedCandidates = [...candidates]
+  for (const c of sortedCandidates) {
+    if (out.length >= limit) break
+    if (chosenIds.has(c.id)) continue
+    const moduleKey = getPathDiversityKey(c.filePath)
+    const introducesModule = !moduleSet.has(moduleKey)
+    const introducesType = !typeSet.has(c.type)
+    const needsModule = moduleSet.size < targetModuleCount
+    const needsType = typeSet.size < targetTypeCount
+
+    if ((needsModule && introducesModule) || (needsType && introducesType)) {
+      out.push(c)
+      chosenIds.add(c.id)
+      moduleSet.add(moduleKey)
+      typeSet.add(c.type)
+    }
+  }
+
+  for (const c of sortedCandidates) {
+    if (out.length >= limit) break
+    if (chosenIds.has(c.id)) continue
+    out.push(c)
+    chosenIds.add(c.id)
+  }
+
+  return out.slice(0, limit)
+}
+
 function selectChatContextResults(
   rerankedResults: ChatSearchResult[],
   vectorResults: ChatSearchResult[],
   query: string,
   limit: number
 ): ChatSearchResult[] {
+  const relevanceOf = (r: ChatSearchResult): number => {
+    return evaluateEvidenceScore(r) + calcQueryCoverageScore(r, queryTokens)
+  }
+  const similarityOf = (a: ChatSearchResult, b: ChatSearchResult): number => {
+    const aTokens = tokenizeQuery(`${a.filePath} ${a.name} ${a.content}`)
+    const bTokens = tokenizeQuery(`${b.filePath} ${b.name} ${b.content}`)
+    if (aTokens.length === 0 || bTokens.length === 0) return 0
+    const bSet = new Set(bTokens.map((t) => t.toLowerCase()))
+    let inter = 0
+    aTokens.forEach((t) => {
+      if (bSet.has(t.toLowerCase())) inter += 1
+    })
+    const union = new Set([...aTokens.map((t) => t.toLowerCase()), ...bTokens.map((t) => t.toLowerCase())]).size
+    return union === 0 ? 0 : inter / union
+  }
+
+  const selectByMMR = (candidates: ChatSearchResult[], topN: number, lambda = 0.7): ChatSearchResult[] => {
+    if (candidates.length <= topN) return candidates.slice(0, topN)
+    const selected: ChatSearchResult[] = []
+    const remaining = [...candidates]
+    remaining.sort((a, b) => relevanceOf(b) - relevanceOf(a))
+    const first = remaining.shift()
+    if (first) selected.push(first)
+
+    while (selected.length < topN && remaining.length > 0) {
+      let bestIndex = 0
+      let bestScore = -Infinity
+      for (let i = 0; i < remaining.length; i++) {
+        const candidate = remaining[i]
+        const relevance = relevanceOf(candidate)
+        let maxSim = 0
+        selected.forEach((s) => {
+          maxSim = Math.max(maxSim, similarityOf(candidate, s))
+        })
+        const mmrScore = lambda * relevance - (1 - lambda) * maxSim * 100
+        if (mmrScore > bestScore) {
+          bestScore = mmrScore
+          bestIndex = i
+        }
+      }
+      selected.push(remaining.splice(bestIndex, 1)[0])
+    }
+    return selected
+  }
+
   const queryTokens = tokenizeQuery(query)
   const selected = new Map<string, ChatSearchResult>()
 
-  rerankedResults.slice(0, limit).forEach((r) => selected.set(r.id, r))
+  const rerankedHead = selectByMMR(rerankedResults, limit)
+  rerankedHead.forEach((r) => selected.set(r.id, r))
 
   const vectorCandidates = vectorResults
     .map((r) => ({
       result: r,
       coverage: calcQueryCoverageScore(r, queryTokens),
+      evidence: evaluateEvidenceScore(r),
+      moduleKey: getPathDiversityKey(r.filePath),
     }))
     .filter((item) => {
       const pathLower = item.result.filePath.toLowerCase()
       const isCodeType = item.result.type === 'function' || item.result.type === 'component'
       return isCodeType && pathLower.includes('/src/') && !pathLower.includes('/docs/')
     })
-    .sort((a, b) => b.coverage - a.coverage || a.result.score - b.result.score)
+    .sort((a, b) => b.coverage - a.coverage || b.evidence - a.evidence || a.result.score - b.result.score)
+
+  const selectedModuleKeys = new Set(Array.from(selected.values()).map((r) => getPathDiversityKey(r.filePath)))
 
   for (const item of vectorCandidates) {
     if (selected.size >= limit) break
-    if (item.coverage <= 0) continue
+    const sameModuleBridge = item.coverage <= 0 && selectedModuleKeys.has(item.moduleKey) && item.evidence >= 170
+    const highEvidenceFallback = item.coverage <= 0 && item.evidence >= 220
+    if (item.coverage <= 0 && !sameModuleBridge && !highEvidenceFallback) continue
     selected.set(item.result.id, item.result)
+    selectedModuleKeys.add(item.moduleKey)
   }
 
-  return Array.from(selected.values()).slice(0, limit)
+  const baseSelected = Array.from(selected.values())
+  const globalCandidates = rerankForChat(
+    mergeUniqueResults(baseSelected, rerankedResults),
+    query
+  )
+  const diversified = expandByDiversity(baseSelected, globalCandidates, limit)
+  return selectByMMR(diversified, limit)
+}
+
+/** 拼接 chunk + metadata + 文件路径，生成可投喂的上下文块 */
+function buildContextBlocks(
+  results: Array<{
+    filePath: string
+    startLine: number
+    endLine: number
+    name: string
+    type: string
+    content: string
+    dependencies?: string[]
+  }>,
+  options?: { query?: string; snippetChars?: number }
+): string {
+  const { query, snippetChars = 1200 } = options || {}
+  return results
+    .map((r, i) => {
+      const content =
+        query && snippetChars
+          ? extractRelevantSnippet(r.content, query, snippetChars)
+          : r.content
+      const lines = [
+        `来源[${i + 1}]`,
+        `文件: ${r.filePath}:${r.startLine}-${r.endLine}`,
+        `名称: ${r.name}`,
+        `类型: ${r.type}`,
+      ]
+      if (r.dependencies && r.dependencies.length > 0) {
+        lines.push(`依赖: ${r.dependencies.join(', ')}`)
+      }
+      lines.push('代码片段:', content)
+      return lines.join('\n')
+    })
+    .join('\n\n---\n\n')
+}
+
+function extractRelevantSnippet(content: string, query: string, maxChars: number): string {
+  if (content.length <= maxChars) return content
+  const queryTokens = tokenizeQuery(query).filter((t) => t.length >= 2)
+  const contentLower = content.toLowerCase()
+
+  let hitIndex = -1
+  for (const token of queryTokens) {
+    const idx = contentLower.indexOf(token.toLowerCase())
+    if (idx >= 0) {
+      hitIndex = idx
+      break
+    }
+  }
+
+  if (hitIndex < 0) {
+    return `${content.substring(0, maxChars)}...`
+  }
+
+  const halfWindow = Math.floor(maxChars / 2)
+  let start = Math.max(0, hitIndex - halfWindow)
+  let end = Math.min(content.length, start + maxChars)
+  if (end - start < maxChars) {
+    start = Math.max(0, end - maxChars)
+  }
+
+  const prefix = start > 0 ? '...' : ''
+  const suffix = end < content.length ? '...' : ''
+  return `${prefix}${content.substring(start, end)}${suffix}`
+}
+
+function hasValidSourceCitation(answer: string, sourceCount: number): boolean {
+  const hasSections = /##\s*结论/.test(answer) && /##\s*证据/.test(answer)
+  if (!hasSections) return false
+
+  const matches = answer.match(/来源\[(\d+)\]/g) || []
+  if (matches.length === 0) return false
+
+  const validCitationSet = new Set<number>()
+  matches.forEach((m) => {
+    const num = Number(m.replace(/[^\d]/g, ''))
+    if (Number.isFinite(num) && num >= 1 && num <= sourceCount) {
+      validCitationSet.add(num)
+    }
+  })
+
+  const conclusionBlockMatch = answer.match(/##\s*结论([\s\S]*?)(##\s*证据|##\s*不确定项|##\s*建议|$)/)
+  const conclusionBlock = conclusionBlockMatch?.[1] || ''
+  const conclusionHasCitation = /来源\[\d+\]/.test(conclusionBlock)
+
+  const minDistinct = Math.min(2, sourceCount)
+  return validCitationSet.size >= minDistinct && conclusionHasCitation
+}
+
+function countDistinctValidCitations(answer: string, sourceCount: number): number {
+  const matches = answer.match(/来源\[(\d+)\]/g) || []
+  const valid = new Set<number>()
+  matches.forEach((m) => {
+    const num = Number(m.replace(/[^\d]/g, ''))
+    if (Number.isFinite(num) && num >= 1 && num <= sourceCount) {
+      valid.add(num)
+    }
+  })
+  return valid.size
+}
+
+function hasCodeFence(answer: string): boolean {
+  return /```/.test(answer)
+}
+
+function buildGroundedFallbackAnswer(
+  question: string,
+  results: Array<{
+    filePath: string
+    startLine: number
+    endLine: number
+    name: string
+    type: string
+    content: string
+  }>
+): string {
+  const top = results.slice(0, Math.min(results.length, 4))
+  const conclusionCount = Math.min(2, top.length)
+  const evidenceCount = Math.min(3, top.length)
+  const conclusionLines = top.slice(0, conclusionCount).map((r, i) => {
+    return `${i + 1}. 当前上下文可确认与问题相关的代码入口为 \`${r.name}\`（来源[${i + 1}]）。`
+  })
+  const evidenceLines = top.slice(0, evidenceCount).map((r, i) => {
+    return `${i + 1}. 来源[${i + 1}]：\`${r.name}\`（${r.type}），位置 \`${r.filePath}:${r.startLine}-${r.endLine}\`。`
+  })
+
+  return [
+    '## 结论',
+    ...conclusionLines,
+    '',
+    '## 证据',
+    ...evidenceLines,
+    '',
+    '## 不确定项',
+    `当前上下文不足以完整还原“${question}”的全链路细节，仍需更多调用链/数据加载代码片段。`,
+    '',
+    '## 建议',
+    '建议补充同模块下的调用函数与数据请求函数后再生成完整流程结论。',
+  ].join('\n')
 }
 
 program
@@ -291,6 +616,76 @@ program
       console.log(table.toString())
     } catch (error) {
       console.error(chalk.red('✗ 获取项目列表失败:'), error instanceof Error ? error.message : error)
+      process.exit(1)
+    }
+  })
+
+// 将自然语言问题改写为贴近代码语义的查询（便于 RAG 检索）
+// 仅描述任务与原则，不硬编码业务术语，由 LLM 根据问题自行推断
+const REWRITE_SYSTEM_PROMPT = `将用户的自然语言问题改写成用于代码检索的查询串。要求：
+- 仅输出英文，禁止中文字符。
+- 输出多个英文关键词，空格分隔，覆盖模块、动作、对象等概念（如: weather is beautiful）。
+- 不要输出单个 camelCase 或 method.path 形式的标识符。
+- 仅输出改写结果，无前缀后缀无解释。
+- 如果中英文混杂，那么文本要分隔开`
+
+program
+  .command('rewrite')
+  .description('将自然语言问题改写为贴近代码的查询（便于 chat/search 检索）')
+  .argument('<question>', '自然语言问题')
+  .option('-m, --model <name>', '指定聊天模型（如 qwen2.5-coder:7b）')
+  .action(async (question, options) => {
+    const spinner = ora('正在改写查询...').start()
+    try {
+      const config = await loadConfig()
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        chatModel: options.model || (config as any).ollama?.chatModel,
+      })
+      const messages = [
+        { role: 'system', content: REWRITE_SYSTEM_PROMPT },
+        { role: 'user', content: question },
+      ]
+      const rewritten = await ollamaClient.chat(messages)
+      spinner.succeed('改写完成: '+REWRITE_SYSTEM_PROMPT)
+      console.log(chalk.cyan(rewritten.trim()))
+      console.log(chalk.gray('\n可直接复制上述结果用于: yarn rag chat "<改写结果>"'))
+    } catch (error) {
+      spinner.fail('改写失败')
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)))
+      process.exit(1)
+    }
+  })
+
+// 将输入转为向量（与 search 使用的 embedding 一致）
+program
+  .command('embed')
+  .description('将输入文本转为向量，输出 search 使用的 embedding 结果')
+  .argument('<text>', '输入文本')
+  .option('--compact', '仅输出维度与预览，不输出完整向量')
+  .action(async (text, options) => {
+    const spinner = ora('正在生成 embedding...').start()
+    try {
+      const config = await loadConfig()
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+      })
+      const vector = await ollamaClient.generateEmbedding(text)
+      const arr = Array.from(vector)
+      spinner.succeed(`embedding 完成（维度: ${arr.length}）`)
+      if (options.compact) {
+        const preview = arr.slice(0, 5).map((v) => v.toFixed(6))
+        console.log(chalk.cyan(`维度: ${arr.length}`))
+        console.log(chalk.gray(`预览 [0..4]: [${preview.join(', ')}...]`))
+      } else {
+        console.log(JSON.stringify(arr))
+      }
+    } catch (error) {
+      spinner.fail('embedding 失败')
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)))
       process.exit(1)
     }
   })
@@ -423,9 +818,8 @@ program
     }
   })
 
-// 搜索代码（旧命令，默认不对外暴露）
-if (ENABLE_LEGACY_COMMANDS) {
-  program
+// 搜索代码（用于结果集验证）
+program
     .command('search')
     .description('搜索代码')
     .argument('<query>', '搜索查询')
@@ -504,18 +898,283 @@ if (ENABLE_LEGACY_COMMANDS) {
       process.exit(1)
     }
     })
+
+// Rerank 命令：向量召回 + 规则重排，展示最相关的 chunk 在前
+program
+  .command('rerank')
+  .description('向量检索 + 规则 Rerank，展示最相关的 chunk 在前')
+  .argument('<query>', '搜索查询')
+  .option('-l, --limit <number>', '向量召回数量', '30')
+  .option('-k, --top-k <number>', '展示前 k 条结果', '10')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-v, --verbose', '显示代码片段')
+  .action(async (query, options) => {
+    const spinner = ora('rerank 检索中...').start()
+    try {
+      const config = await loadConfig()
+      const limit = Math.max(1, parseInt(options.limit))
+      const topK = Math.max(1, parseInt(options.topK))
+
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      const searchOpts: Record<string, unknown> = { limit }
+      if (options.project) searchOpts.projects = [options.project]
+
+      spinner.text = '向量检索...'
+      let results = await indexStore.search(query, searchOpts) as ChatSearchResult[]
+
+      if (results.length === 0) {
+        spinner.warn('未找到相关 chunk')
+        console.log(chalk.yellow('请确认已建立索引或更换查询。'))
+        return
+      }
+
+      // 填充 keywordMatches 供 rerank 使用
+      const queryTokens = tokenizeQuery(query)
+      results = results.map((r) => ({
+        ...r,
+        keywordMatches: queryTokens.filter(
+          (t) => `${r.filePath} ${r.name} ${r.content}`.toLowerCase().includes(t.toLowerCase())
+        ),
+      }))
+
+      spinner.text = '规则 Rerank...'
+      const reranked = rerankForChat(results, query)
+      const displayList = reranked.slice(0, topK)
+
+      spinner.succeed(`rerank 完成（召回 ${results.length}，展示前 ${displayList.length}）`)
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('🔍 Rerank 结果（最相关在前）'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.gray(`查询: ${query}\n`))
+
+      displayList.forEach((r, i) => {
+        const evidenceScore = evaluateEvidenceScore(r)
+        const coverageScore = calcQueryCoverageScore(r, queryTokens)
+        const totalScore = evidenceScore + coverageScore
+
+        console.log(chalk.cyan(`\n--- [${i + 1}] ${r.name}`))
+        console.log(chalk.gray(`    文件: ${r.filePath}:${r.startLine}-${r.endLine}`))
+        console.log(chalk.gray(`    类型: ${r.type}`))
+        console.log(chalk.gray(`    向量距离: ${r.score.toFixed(4)} | Rerank 分: ${totalScore.toFixed(0)} (evidence=${evidenceScore.toFixed(0)} + coverage=${coverageScore.toFixed(0)})`))
+        if (r.keywordMatches?.length) {
+          console.log(chalk.gray(`    关键词命中: ${r.keywordMatches.join(', ')}`))
+        }
+        if (options.verbose && r.content) {
+          const snippet = r.content.length > 300 ? r.content.substring(0, 300) + '...' : r.content
+          console.log(chalk.green('    片段: ') + chalk.white(snippet))
+        }
+      })
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+    } catch (error) {
+      spinner.fail('rerank 失败')
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)))
+      process.exit(1)
+    }
+  })
+
+// 粗略估算中英混合文本的 token 数（约 2.5 字符/token）
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 2.5)
 }
+
+// Context 命令：输出拼接后的 chunk + metadata + 文件路径（可投喂 LLM 的上下文）
+program
+  .command('context')
+  .description('向量检索 + Rerank，输出拼接的 chunk + metadata + 文件路径')
+  .argument('<query>', '搜索查询')
+  .option('-l, --limit <number>', '向量召回数量', '30')
+  .option('-k, --top-k <number>', '取前 k 条拼接', '10')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-s, --snippet-chars <number>', '每个 chunk 最大字符数', '1200')
+  .option('-c, --model-context <number>', '当前模型上下文上限（token），默认 32768', '32768')
+  .action(async (query, options) => {
+    const spinner = ora('context 检索中...').start()
+    try {
+      const config = await loadConfig()
+      const limit = Math.max(1, parseInt(options.limit))
+      const topK = Math.max(1, parseInt(options.topK))
+      const snippetChars = Math.max(200, parseInt(options.snippetChars))
+
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      const searchOpts: Record<string, unknown> = { limit }
+      if (options.project) searchOpts.projects = [options.project]
+
+      spinner.text = '向量检索...'
+      let results = await indexStore.search(query, searchOpts) as ChatSearchResult[]
+
+      if (results.length === 0) {
+        spinner.warn('未找到相关 chunk')
+        console.log(chalk.yellow('请确认已建立索引或更换查询。'))
+        return
+      }
+
+      const queryTokens = tokenizeQuery(query)
+      results = results.map((r) => ({
+        ...r,
+        keywordMatches: queryTokens.filter(
+          (t) => `${r.filePath} ${r.name} ${r.content}`.toLowerCase().includes(t.toLowerCase())
+        ),
+      }))
+
+      spinner.text = 'Rerank + 拼接...'
+      const reranked = rerankForChat(results, query)
+      const topResults = reranked.slice(0, topK)
+
+      const contextResults = topResults.map((r) => ({
+        ...r,
+        content: extractRelevantSnippet(r.content, query, snippetChars),
+      }))
+      const contextText = buildContextBlocks(contextResults)
+      const fullPrompt = buildChatPrompt(query, contextResults)
+
+      const modelContextLimit = Number(process.env.AI_RAG_CHAT_CONTEXT || options.modelContext || 32768)
+      const assembledChars = fullPrompt.length
+      const assembledTokens = estimateTokens(fullPrompt)
+      const usagePct = ((assembledTokens / modelContextLimit) * 100).toFixed(1)
+      const remainingTokens = Math.max(0, modelContextLimit - assembledTokens)
+
+      spinner.succeed(`context 完成（召回 ${results.length}，拼接 ${topResults.length}）`)
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('📊 投喂 LLM 统计'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.gray(`模型上下文上限: ${modelContextLimit.toLocaleString()} token`))
+      console.log(chalk.gray(`组装内容字符数: ${assembledChars.toLocaleString()}`))
+      console.log(chalk.gray(`组装内容预估: ${assembledTokens.toLocaleString()} token`))
+      console.log(chalk.gray(`占比: ${usagePct}% | 剩余: ${remainingTokens.toLocaleString()} token`))
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('📦 拼接后的上下文（chunk + metadata + 文件路径）'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(contextText))
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+    } catch (error) {
+      spinner.fail('context 失败')
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)))
+      process.exit(1)
+    }
+  })
+
+// LLM 命令：context 投喂给 LLM，返回处理后的结果
+program
+  .command('llm')
+  .description('将 context 投喂给 LLM，返回处理后的结果')
+  .argument('<query>', '搜索查询')
+  .option('-l, --limit <number>', '向量召回数量', '30')
+  .option('-k, --top-k <number>', '取前 k 条投喂', '10')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-s, --snippet-chars <number>', '每个 chunk 最大字符数', '1200')
+  .option('-m, --model <name>', '指定聊天模型')
+  .option('--show-stats', '显示投喂统计')
+  .action(async (query, options) => {
+    const spinner = ora('llm 检索中...').start()
+    try {
+      const config = await loadConfig()
+      const limit = Math.max(1, parseInt(options.limit))
+      const topK = Math.max(1, parseInt(options.topK))
+      const snippetChars = Math.max(200, parseInt(options.snippetChars))
+
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+        chatModel: options.model || (config as any).ollama?.chatModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      const searchOpts: Record<string, unknown> = { limit }
+      if (options.project) searchOpts.projects = [options.project]
+
+      spinner.text = '向量检索...'
+      let results = await indexStore.search(query, searchOpts) as ChatSearchResult[]
+
+      if (results.length === 0) {
+        spinner.warn('未找到相关 chunk')
+        console.log(chalk.yellow('请确认已建立索引或更换查询。'))
+        return
+      }
+
+      const queryTokens = tokenizeQuery(query)
+      results = results.map((r) => ({
+        ...r,
+        keywordMatches: queryTokens.filter(
+          (t) => `${r.filePath} ${r.name} ${r.content}`.toLowerCase().includes(t.toLowerCase())
+        ),
+      }))
+
+      spinner.text = 'Rerank + 拼接...'
+      const reranked = rerankForChat(results, query)
+      const topResults = reranked.slice(0, topK)
+      const contextResults = topResults.map((r) => ({
+        ...r,
+        content: extractRelevantSnippet(r.content, query, snippetChars),
+      }))
+
+      spinner.text = 'LLM 生成中...'
+      const prompt = buildChatPrompt(query, contextResults)
+      const answer = await ollamaClient.chat(prompt)
+      spinner.succeed(`llm 完成（检索 ${results.length}，投喂 ${contextResults.length}）`)
+
+      if (options.showStats) {
+        const modelContextLimit = Number(process.env.AI_RAG_CHAT_CONTEXT || 32768)
+        const assembledTokens = estimateTokens(prompt)
+        const usagePct = ((assembledTokens / modelContextLimit) * 100).toFixed(1)
+        console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+        console.log(chalk.cyan.bold('📊 投喂统计'))
+        console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+        console.log(chalk.gray(`模型上下文上限: ${modelContextLimit.toLocaleString()} token`))
+        console.log(chalk.gray(`组装内容预估: ${assembledTokens.toLocaleString()} token (${usagePct}%)`))
+        console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      }
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('💬 问题'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(query))
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('🧠 LLM 回答'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(answer.trim()))
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+    } catch (error) {
+      spinner.fail('llm 失败')
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)))
+      process.exit(1)
+    }
+  })
 
 // Chat 命令
 program
   .command('chat')
   .description('基于代码索引进行问答（检索 + LLM 回答）')
   .argument('<question>', '问题描述')
-  .option('-l, --limit <number>', '检索结果数量（向量召回）', '6')
+  .option('-l, --limit <number>', '检索结果数量（向量召回）', '8')
   .option('-p, --project <name>', '指定项目名称')
   .option('-s, --show-sources', '显示引用来源详情')
-  .option('--context-limit <number>', '用于回答的片段数量', '3')
-  .option('--snippet-chars <number>', '每个片段最大字符数', '500')
+  .option('--context-limit <number>', '用于回答的片段数量', '6')
+  .option('--snippet-chars <number>', '每个片段最大字符数', '1400')
   .option('-m, --model <name>', '指定聊天模型（如 qwen2.5-coder:7b）')
   .option('--fast', '快速模式（更少上下文，更快回答）')
   .action(async (question, options) => {
@@ -528,8 +1187,11 @@ program
       const contextLimit = Math.max(1, parseInt(options.contextLimit))
       const snippetChars = Math.max(200, parseInt(options.snippetChars))
       const fastMode = !!options.fast
+      const queryTokenCount = tokenizeQuery(question).length
+      const adaptiveBoost = queryTokenCount >= 8 ? 4 : queryTokenCount >= 5 ? 2 : 0
+      const effectiveSearchLimit = searchLimit + adaptiveBoost
 
-      const finalContextLimit = fastMode ? Math.min(contextLimit, 2) : contextLimit
+      const finalContextLimit = fastMode ? Math.min(contextLimit, 3) : contextLimit
       const finalSnippetChars = fastMode ? Math.min(snippetChars, 320) : snippetChars
 
       const ollamaClient = new OllamaClient({
@@ -543,27 +1205,52 @@ program
         ollamaClient
       )
 
-      const searchOptions: any = { limit: searchLimit }
+      const searchOptions: any = { limit: effectiveSearchLimit }
       if (options.project) {
         searchOptions.projects = [options.project]
       }
 
       spinner.text = '正在检索相关代码...'
       const searchStart = Date.now()
-      const smartResults = await indexStore.smartSearch(question, searchOptions)
-      const vectorResults = await indexStore.search(question, {
+      const smartResults = await indexStore.search(question, {
         ...searchOptions,
-        limit: Math.max(searchLimit * 2, 12),
+        limit: Math.max(searchLimit * 3, 24),
       })
+      let vectorResults = await indexStore.search(question, {
+        ...searchOptions,
+        limit: Math.max(searchLimit * 3, 24),
+      })
+      const recallQueries = buildRecallQueries(question)
+      for (const recallQuery of recallQueries.slice(1)) {
+        const extraVectorResults = await indexStore.search(recallQuery, {
+          ...searchOptions,
+          limit: Math.max(searchLimit * 2, 16),
+        })
+        vectorResults = mergeUniqueResults(
+          vectorResults as ChatSearchResult[],
+          extraVectorResults as ChatSearchResult[]
+        )
+      }
       let results = mergeUniqueResults(smartResults as ChatSearchResult[], vectorResults as ChatSearchResult[])
       results = rerankForChat(results as ChatSearchResult[], question)
+
+      // 通用桥接召回：根据初始候选自动提取标识符做二次向量检索，补全主链路函数
+      const bridgeQuery = buildBridgeQuery(question, results as ChatSearchResult[])
+      if (bridgeQuery !== question) {
+        const bridgeVectorResults = await indexStore.search(bridgeQuery, {
+          ...searchOptions,
+          limit: Math.max(searchLimit * 3, 24),
+        })
+        results = mergeUniqueResults(results as ChatSearchResult[], bridgeVectorResults as ChatSearchResult[])
+        results = rerankForChat(results as ChatSearchResult[], question)
+      }
 
       // 仍然证据偏弱时，再次放大向量候选并重排
       if (!hasEnoughCodeEvidence(results as ChatSearchResult[], question)) {
         spinner.text = '检测到证据偏弱，追加更多向量候选...'
-        const widerVectorResults = await indexStore.search(question, {
+        const widerVectorResults = await indexStore.search(bridgeQuery, {
           ...searchOptions,
-          limit: Math.max(searchLimit * 4, 20),
+          limit: Math.max(searchLimit * 5, 40),
         })
         results = mergeUniqueResults(results as ChatSearchResult[], widerVectorResults as ChatSearchResult[])
         results = rerankForChat(results as ChatSearchResult[], question)
@@ -585,15 +1272,82 @@ program
         finalContextLimit
       )
 
-      const contextResults = selectedContextResults.map((r) => ({
+      let contextResults = selectedContextResults.map((r) => ({
         ...r,
-        content: r.content.substring(0, finalSnippetChars),
+        content: extractRelevantSnippet(r.content, question, finalSnippetChars),
       }))
 
       spinner.text = '正在生成回答...'
       const chatStart = Date.now()
       const prompt = buildChatPrompt(question, contextResults)
-      const answer = await ollamaClient.chat(prompt)
+      let answer = await ollamaClient.chat(prompt)
+      if (!hasValidSourceCitation(answer, contextResults.length)) {
+        spinner.text = '检测到回答缺少有效来源，进行一次强约束重试...'
+        const strictPrompt = `${prompt}
+
+你上一版回答缺少有效来源编号。请重写并满足：
+1) 使用“## 结论 / ## 证据 / ## 不确定项 / ## 建议”四段。
+2) “## 结论”中每条结论必须包含来源编号（来源[1]...）。
+3) “## 证据”中至少列出2条来源映射（来源编号 + 证据点）。
+4) 只允许引用 1 到 ${contextResults.length} 的来源编号。
+5) 若证据不足，明确写“当前上下文不足以确定”。`
+        answer = await ollamaClient.chat(strictPrompt)
+      }
+
+      // 通用兜底：若回答仅依赖单一来源，自动扩展上下文重答一次，提升证据覆盖广度
+      const distinctCitations = countDistinctValidCitations(answer, contextResults.length)
+      if (distinctCitations < Math.min(2, contextResults.length) && results.length > contextResults.length) {
+        spinner.text = '检测到证据来源过于单一，扩展上下文重试一次...'
+        const expandedLimit = Math.min(
+          results.length,
+          Math.max(contextResults.length + 2, Math.min(finalContextLimit + 2, 8))
+        )
+        contextResults = selectChatContextResults(
+          results as ChatSearchResult[],
+          vectorResults as ChatSearchResult[],
+          question,
+          expandedLimit
+        ).map((r) => ({
+          ...r,
+          content: extractRelevantSnippet(r.content, question, finalSnippetChars),
+        }))
+
+        const expandedPrompt = `${buildChatPrompt(question, contextResults)}
+
+请确保：
+1) 结论和证据至少覆盖 2 个不同来源编号（若上下文不足则在“不确定项”说明）。
+2) 只允许引用 1 到 ${contextResults.length} 的来源编号。`
+        answer = await ollamaClient.chat(expandedPrompt)
+
+        if (!hasValidSourceCitation(answer, contextResults.length)) {
+          const expandedStrictPrompt = `${buildChatPrompt(question, contextResults)}
+
+你上一版回答缺少有效来源编号。请重写并满足：
+1) 使用“## 结论 / ## 证据 / ## 不确定项 / ## 建议”四段。
+2) “## 结论”中每条结论必须包含来源编号（来源[1]...）。
+3) “## 证据”中至少列出2条来源映射（来源编号 + 证据点）。
+4) 只允许引用 1 到 ${contextResults.length} 的来源编号。
+5) 若证据不足，明确写“当前上下文不足以确定”。`
+          answer = await ollamaClient.chat(expandedStrictPrompt)
+        }
+      }
+
+      if (hasCodeFence(answer)) {
+        spinner.text = '检测到回答包含示例代码，重试生成事实型回答...'
+        const noCodePrompt = `${buildChatPrompt(question, contextResults)}
+
+你上一版回答包含代码块。请重写并满足：
+1) 只输出事实结论，不要输出任何代码块（禁止 \`\`\`）。
+2) 每条结论必须绑定来源编号。
+3) 若上下文不足，请在“不确定项”说明，禁止脑补实现。`
+        answer = await ollamaClient.chat(noCodePrompt)
+      }
+
+      // 最终兜底：若仍不满足来源约束，直接生成可验证的保底答案，避免“检索与回答不一致”
+      if (!hasValidSourceCitation(answer, contextResults.length)) {
+        spinner.text = '检测到回答仍未通过来源校验，输出保底事实回答...'
+        answer = buildGroundedFallbackAnswer(question, contextResults)
+      }
       const chatCostMs = Date.now() - chatStart
       const totalCostMs = Date.now() - totalStart
 
@@ -637,6 +1391,86 @@ program
       if (error instanceof Error && error.stack) {
         console.error(chalk.gray(error.stack))
       }
+      process.exit(1)
+    }
+  })
+
+// Chat-v2：最简 Rerank + TopK，无额外召回/重试逻辑（隐藏）
+program
+  .command('chat-v2', { hidden: true })
+  .description('简化版问答：向量检索 + Rerank/TopK 取最相关片段 + LLM 回答')
+  .argument('<question>', '问题描述')
+  .option('-l, --limit <number>', '向量召回数量', '16')
+  .option('-k, --top-k <number>', '取 top-k 最相关片段用于回答', '6')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-s, --show-sources', '显示引用来源详情')
+  .option('-m, --model <name>', '指定聊天模型')
+  .action(async (question, options) => {
+    const spinner = ora('chat-v2 检索中...').start()
+    try {
+      const config = await loadConfig()
+      const limit = Math.max(1, parseInt(options.limit))
+      const topK = Math.max(1, parseInt(options.topK))
+
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+        chatModel: options.model || (config as any).ollama?.chatModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      const searchOpts: Record<string, unknown> = { limit }
+      if (options.project) searchOpts.projects = [options.project]
+
+      spinner.text = '向量检索...'
+      let results = await indexStore.search(question, searchOpts) as ChatSearchResult[]
+
+      if (results.length === 0) {
+        spinner.warn('未找到相关代码')
+        console.log(chalk.yellow('请确认已建立索引或更换问题。'))
+        return
+      }
+
+      // Rerank：按 score 升序（距离越小越相关）
+      results = [...results].sort((a, b) => a.score - b.score)
+
+      // TopK：取前 K 个
+      const contextResults = results.slice(0, topK).map((r) => ({
+        ...r,
+        content: extractRelevantSnippet(r.content, question, 1200),
+      }))
+
+      spinner.text = '生成回答...'
+      const prompt = buildChatPrompt(question, contextResults)
+      const answer = await ollamaClient.chat(prompt)
+      spinner.succeed(`chat-v2 完成（检索 ${results.length}，参考 ${contextResults.length}）`)
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('💬 问题'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(question))
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('🧠 回答'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(answer.trim()))
+
+      if (options.showSources) {
+        console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+        console.log(chalk.cyan.bold('📚 引用来源'))
+        console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+        contextResults.forEach((r, i) => {
+          console.log(chalk.green(`[${i + 1}] ${r.name}`))
+          console.log(chalk.gray(`    文件: ${r.filePath}:${r.startLine}-${r.endLine}  距离: ${r.score.toFixed(4)}`))
+        })
+      }
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+    } catch (error) {
+      spinner.fail('chat-v2 失败')
+      console.error(chalk.red(error instanceof Error ? error.message : error))
       process.exit(1)
     }
   })

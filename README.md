@@ -6,7 +6,7 @@
 
 - 🔍 **语义搜索**: 基于向量相似度的智能代码搜索，理解代码语义而非简单关键词匹配
 - 📚 **多粒度索引**: 支持文件、函数、组件、代码块多层级索引
-- 🎯 **问答优先**: 默认通过 `chat` 完成检索增强问答，降低命令心智负担
+- 🎯 **问答优先**: 默认通过 `rag:chat`（内部调用 `llm`）完成检索增强问答
 - 🚀 **多种交互方式**: CLI 命令行工具 + Web 可视化界面
 - 🔒 **本地优先**: 所有数据和模型都在本地运行，无需云服务，数据安全
 - ⚡ **增量更新**: 智能检测文件变化，只更新修改的文件
@@ -140,35 +140,80 @@ yarn rag index <project-name> --incremental
 yarn rag index <project-id> --incremental
 ```
 
-### 问答模式（chat）
+### 问答模式（rag:chat / llm）
+
+`yarn rag:chat` 内部调用 `llm` 命令，完成「检索 → 拼接 context → 投喂 LLM → 返回回答」流程：
 
 ```bash
-# 基于检索结果生成分析回答
-yarn rag chat <问题> [options]
+# 推荐：一键问答（等同于 yarn rag llm）
+yarn rag:chat <问题> [options]
 
-# 选项:
-#   -l, --limit <number>         检索候选数量（默认: 6）
+# 或直接调用 llm
+yarn rag llm <问题> [options]
+
+# 选项（llm）:
+#   -l, --limit <number>         向量召回数量（默认: 30）
+#   -k, --top-k <number>         取前 k 条投喂 LLM（默认: 10）
 #   -p, --project <name>         指定项目名称
-#   -s, --show-sources           显示引用来源
-#   --context-limit <number>     参与回答的片段数量（默认: 3）
-#   --snippet-chars <number>     每个片段最大字符数（默认: 500）
-#   -m, --model <name>           指定 chat 模型（如 qwen2.5-coder:7b）
-#   --fast                       快速模式（更少上下文，更快回答）
+#   -s, --snippet-chars <number> 每个 chunk 最大字符数（默认: 1200）
+#   -m, --model <name>           指定聊天模型（如 qwen2.5-coder:7b）
+#   --show-stats                 显示投喂统计
+
+# chat 命令（增强版，含多查询扩展、MMR 多样性选择等）
+yarn rag chat <问题> [options]
+# 选项: -l, -p, -s, --context-limit, --snippet-chars, -m, --fast, --show-sources
 
 # 示例：
-yarn rag chat "某个业务模块的加载逻辑是什么样的" -p <project-name> -s
-yarn rag chat "登录失败时前端怎么处理" -p <project-name> --fast -m qwen2.5-coder:7b
+yarn rag:chat "某个业务模块的加载逻辑是什么样的" -p <project-name>
+yarn rag llm "登录失败时前端怎么处理" -p <project-name> -m qwen2.5-coder:7b
 ```
 
-### 命令模式说明（默认仅 chat）
+### RAG 流水线命令（分步调试）
+
+可按需单独执行检索链路的每一步，便于调试或自定义流程：
+
+| 命令 | 说明 | 快捷脚本 |
+|------|------|----------|
+| `rewrite` | 将自然语言问题改写为贴近代码语义的英文查询 | `yarn rag:rewrite` |
+| `embed` | 将文本转为向量（与 search 使用的 embedding 一致） | `yarn rag:embed` |
+| `rerank` | 向量检索 + 规则 Rerank，展示最相关 chunk | `yarn rag:rerank` |
+| `context` | 向量检索 + Rerank，输出拼接后的 chunk（可投喂 LLM） | `yarn rag:context` |
+| `llm` | 将 context 投喂给 LLM，返回回答 | `yarn rag:llm` |
 
 ```bash
-# 当前 CLI 默认对外仅保留 chat 入口
+# 改写查询（便于检索）
+yarn rag rewrite "用户登录失败时前端怎么处理" -m qwen2.5-coder:7b
+
+# 查看 embedding
+yarn rag embed "user login validation" --compact
+
+# 查看 rerank 结果（不含 LLM）
+yarn rag rerank "login failed" -p <project-name> -l 30 -k 10 -v
+
+# 查看拼接的 context 和投喂统计
+yarn rag context "login failed" -p <project-name> -k 10 --snippet-chars 1200
+```
+
+### 命令模式说明
+
+```bash
+# 查看全部命令
 yarn rag --help
 
-# 如需临时启用旧命令（search/analyze），可设置环境变量
+# 如需启用旧版 search/analyze 等，可设置环境变量
 AI_RAG_ENABLE_LEGACY_COMMANDS=1 yarn rag --help
 ```
+
+### 根目录脚本与命令对应关系
+
+| 脚本 | 对应命令 | 说明 |
+|------|----------|------|
+| `rag:chat` | `llm` | 一键问答（检索 + LLM） |
+| `rag:rewrite` | `rewrite` | 自然语言改写为检索查询 |
+| `rag:embed` | `embed` | 文本转向量 |
+| `rag:rerank` | `rerank` | 向量检索 + 规则 Rerank |
+| `rag:context` | `context` | 输出拼接后的 chunk |
+| `rag:llm` | `llm` | 将 context 投喂 LLM |
 
 ### 命令示例
 
@@ -182,8 +227,10 @@ yarn rag list
 # 3. 构建索引
 yarn rag index <project-id>
 
-# 4. 智能问答
-yarn rag chat "用户登录失败时前端处理逻辑是什么"
+# 4. 智能问答（rag:chat 调用 llm）
+yarn rag:chat "用户登录失败时前端处理逻辑是什么"
+# 或直接使用 llm
+yarn rag llm "用户登录失败时前端处理逻辑是什么" -p <project-name>
 ```
 
 ## 🌐 Web 界面
@@ -444,7 +491,7 @@ yarn rag index <project-id-or-name>
 
 A: `limit` 在不同命令含义不同：
 - `index --limit`：最多处理多少个文件（默认 100）
-- `chat --limit`：检索候选数量（默认 6，最终参与回答还受 `--context-limit` 限制）
+- `chat --limit`：检索候选数量（默认 8，最终参与回答还受 `--context-limit` 限制）
 
 不设置会使用默认值，通常可直接用；需要更高召回时再增大。
 
@@ -488,6 +535,13 @@ A: 所有数据存储在 `.ai-rag-data/` 目录：
 - `cache/` - 代码解析缓存
 
 ## 📝 更新日志
+
+### v1.1.0 (refactor/rag)
+
+- ✨ 新增 RAG 流水线命令：`rewrite`、`embed`、`rerank`、`context`、`llm`
+- 🔄 `rag:chat` 改为调用 `llm`（原 `chat` 保留为增强版，含多查询扩展、MMR 多样性）
+- 📋 新增根目录脚本：`rag:rewrite`、`rag:embed`、`rag:rerank`、`rag:context`、`rag:llm`
+- 🔧 检索链路优化：概念扩展、bridge 查询、MMR 去重、路径多样性
 
 ### v1.0.0 (2026-01-15)
 
