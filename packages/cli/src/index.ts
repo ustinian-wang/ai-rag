@@ -587,7 +587,12 @@ program
 
 // 将自然语言问题改写为贴近代码语义的查询（便于 RAG 检索）
 // 仅描述任务与原则，不硬编码业务术语，由 LLM 根据问题自行推断
-const REWRITE_SYSTEM_PROMPT = `将用户的自然语言问题改写成贴近代码的检索查询：保留原意，用英文函数/变量/组件常见命名风格表达，输出一段简洁连续文本，无前缀后缀无解释。`
+const REWRITE_SYSTEM_PROMPT = `将用户的自然语言问题改写成用于代码检索的查询串。要求：
+- 仅输出英文，禁止中文字符。
+- 输出多个英文关键词，空格分隔，覆盖模块、动作、对象等概念（如: weather is beautiful）。
+- 不要输出单个 camelCase 或 method.path 形式的标识符。
+- 仅输出改写结果，无前缀后缀无解释。
+- 如果中英文混杂，那么文本要分隔开`
 
 program
   .command('rewrite')
@@ -609,7 +614,7 @@ program
         { role: 'user', content: question },
       ]
       const rewritten = await ollamaClient.chat(messages)
-      spinner.succeed('改写完成')
+      spinner.succeed('改写完成: '+REWRITE_SYSTEM_PROMPT)
       console.log(chalk.cyan(rewritten.trim()))
       console.log(chalk.gray('\n可直接复制上述结果用于: yarn rag chat "<改写结果>"'))
     } catch (error) {
@@ -1054,6 +1059,86 @@ program
       if (error instanceof Error && error.stack) {
         console.error(chalk.gray(error.stack))
       }
+      process.exit(1)
+    }
+  })
+
+// Chat-v2：最简 Rerank + TopK，无额外召回/重试逻辑
+program
+  .command('chat-v2')
+  .description('简化版问答：向量检索 + Rerank/TopK 取最相关片段 + LLM 回答')
+  .argument('<question>', '问题描述')
+  .option('-l, --limit <number>', '向量召回数量', '16')
+  .option('-k, --top-k <number>', '取 top-k 最相关片段用于回答', '6')
+  .option('-p, --project <name>', '指定项目名称')
+  .option('-s, --show-sources', '显示引用来源详情')
+  .option('-m, --model <name>', '指定聊天模型')
+  .action(async (question, options) => {
+    const spinner = ora('chat-v2 检索中...').start()
+    try {
+      const config = await loadConfig()
+      const limit = Math.max(1, parseInt(options.limit))
+      const topK = Math.max(1, parseInt(options.topK))
+
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+        chatModel: options.model || (config as any).ollama?.chatModel,
+      })
+
+      const indexStore = new IndexStore(
+        path.join(process.cwd(), config.storage.lanceDir),
+        ollamaClient
+      )
+
+      const searchOpts: Record<string, unknown> = { limit }
+      if (options.project) searchOpts.projects = [options.project]
+
+      spinner.text = '向量检索...'
+      let results = await indexStore.search(question, searchOpts) as ChatSearchResult[]
+
+      if (results.length === 0) {
+        spinner.warn('未找到相关代码')
+        console.log(chalk.yellow('请确认已建立索引或更换问题。'))
+        return
+      }
+
+      // Rerank：按 score 升序（距离越小越相关）
+      results = [...results].sort((a, b) => a.score - b.score)
+
+      // TopK：取前 K 个
+      const contextResults = results.slice(0, topK).map((r) => ({
+        ...r,
+        content: extractRelevantSnippet(r.content, question, 1200),
+      }))
+
+      spinner.text = '生成回答...'
+      const prompt = buildChatPrompt(question, contextResults)
+      const answer = await ollamaClient.chat(prompt)
+      spinner.succeed(`chat-v2 完成（检索 ${results.length}，参考 ${contextResults.length}）`)
+
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('💬 问题'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(question))
+      console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+      console.log(chalk.cyan.bold('🧠 回答'))
+      console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+      console.log(chalk.white(answer.trim()))
+
+      if (options.showSources) {
+        console.log(chalk.cyan(`\n${'='.repeat(80)}`))
+        console.log(chalk.cyan.bold('📚 引用来源'))
+        console.log(chalk.cyan(`${'='.repeat(80)}\n`))
+        contextResults.forEach((r, i) => {
+          console.log(chalk.green(`[${i + 1}] ${r.name}`))
+          console.log(chalk.gray(`    文件: ${r.filePath}:${r.startLine}-${r.endLine}  距离: ${r.score.toFixed(4)}`))
+        })
+      }
+      console.log(chalk.cyan(`\n${'='.repeat(80)}\n`))
+    } catch (error) {
+      spinner.fail('chat-v2 失败')
+      console.error(chalk.red(error instanceof Error ? error.message : error))
       process.exit(1)
     }
   })
