@@ -585,6 +585,40 @@ program
     }
   })
 
+// 将自然语言问题改写为贴近代码语义的查询（便于 RAG 检索）
+// 仅描述任务与原则，不硬编码业务术语，由 LLM 根据问题自行推断
+const REWRITE_SYSTEM_PROMPT = `将用户的自然语言问题改写成贴近代码的检索查询：保留原意，用英文函数/变量/组件常见命名风格表达，输出一段简洁连续文本，无前缀后缀无解释。`
+
+program
+  .command('rewrite')
+  .description('将自然语言问题改写为贴近代码的查询（便于 chat/search 检索）')
+  .argument('<question>', '自然语言问题')
+  .option('-m, --model <name>', '指定聊天模型（如 qwen2.5-coder:7b）')
+  .action(async (question, options) => {
+    const spinner = ora('正在改写查询...').start()
+    try {
+      const config = await loadConfig()
+      const ollamaClient = new OllamaClient({
+        baseUrl: config.ollama.baseUrl,
+        embeddingModel: config.ollama.embeddingModel,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        chatModel: options.model || (config as any).ollama?.chatModel,
+      })
+      const messages = [
+        { role: 'system', content: REWRITE_SYSTEM_PROMPT },
+        { role: 'user', content: question },
+      ]
+      const rewritten = await ollamaClient.chat(messages)
+      spinner.succeed('改写完成')
+      console.log(chalk.cyan(rewritten.trim()))
+      console.log(chalk.gray('\n可直接复制上述结果用于: yarn rag chat "<改写结果>"'))
+    } catch (error) {
+      spinner.fail('改写失败')
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)))
+      process.exit(1)
+    }
+  })
+
 // 构建索引
 program
   .command('index')
